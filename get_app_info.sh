@@ -44,11 +44,11 @@ for i in $(seq 1 $(cf curl "/v2/apps?results-per-page=100" | jq '.total_pages'))
             service_name=$(cf curl "$service_url" | jq -r '.entity.service_broker_name')
             service_plan=$(cf curl "$service_plan_url" | jq -r '.entity.name')
           fi  
-          
+
           # Append the service name and plan to the services string
           services+="${service_name} (${service_plan}):"
 
-        done < <(cf curl "$service_binding_url" | jq -c '.resources[].entity.service_instance_url')  
+        done < <(cf curl "$service_binding_url" | jq -r -c '.resources[].entity.service_instance_url')  
 
         # Get all routes of the app
         routes=""
