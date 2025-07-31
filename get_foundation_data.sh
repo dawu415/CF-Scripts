@@ -95,8 +95,9 @@ process_app() {
         if [[ -z "$stack_name" || "$stack_name" == "null" ]]; then
             buildpack_filename=$(cf curl "/v2/buildpacks?results-per-page=100" | jq -r --arg buildpack "$input" '.resources[] | select(.entity.name == $buildpack) | .entity.filename' | head -n 1)
         else
-            buildpack_filename=$(cf curl "/v2/buildpacks?results-per-page=100" | jq -r --arg buildpack "$input" '.resources[] | select(.entity.name == $buildpack) | .entity.filename' | grep -i "$stack_name" | head -n 1)
-        
+            buildpack_filename=$(cf curl "/v2/buildpacks?results-per-page=100" | jq -r --arg buildpack "$input" '.resources[] | select(.entity.name == $buildpack) | .entity.filename' | grep -i "$stack_name" | head -n 1)    
+        fi
+               
     else
         # if detected_buildpack_guid is not null, we can use it to get the buildpack filename directly.
         buildpack_filename=$(cf curl "/v2/buildpacks/${detected_buildpack_guid}" | jq -r '.entity.filename')
