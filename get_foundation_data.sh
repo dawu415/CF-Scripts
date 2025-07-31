@@ -105,12 +105,13 @@ process_app() {
 }
 
 export -f process_app
+export -f get_version_info
 
 # Main processing with GNU parallel (if available) or xargs
 total_pages=$(cf curl "/v2/apps?results-per-page=100" | jq '.total_pages')
 
 for i in $(seq 1 $total_pages); do
-    echo "Processing page: $i of $total_pages" >&2
+    #echo "Processing page: $i of $total_pages" >&2
     
     # Option A: Use GNU parallel if available (FASTEST)
     if command -v parallel &> /dev/null; then
