@@ -116,9 +116,11 @@ total_pages=$(cf curl "/v2/apps?results-per-page=100" | jq '.total_pages // 1')
 
 for i in $(seq 1 $total_pages); do
     if command -v parallel &> /dev/null; then
-        cf curl "/v2/apps?page=$i&results-per-page=100" | jq -r -c '.resources // [] | .[]' | parallel -j 10 process_app
+        cf curl "/v2/apps?page=$i&results-per-page=100" | jq -c '.resources // [] | .[]' | parallel -j 10 process_app
     else
-        cf curl "/v2/apps?page=$i&results-per-page=100" | jq -r -c '.resources // [] | .[] | @json' | xargs -P 10 -I {} bash -c 'process_app "$@"' _ {}
+        cf curl "/v2/apps?page=$i&results-per-page=100" | jq -c '.resources // [] | .[]' | \
+        while IFS= read -r app; do
+            printf '%s\0' "$app"
+        done | xargs -0 -P 10 -I {} bash -c 'process_app "$@"' _ {}
     fi
 done
-
