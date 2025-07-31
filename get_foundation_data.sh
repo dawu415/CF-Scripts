@@ -1,12 +1,15 @@
 get_version_info() {
     local app_guid=$1
     local detected_buildpack=$2
+    local buildpack_filename=$3
     
     # Quick method - just get environment variables
     env_data=$(cf curl "/v2/apps/${app_guid}/env" 2>/dev/null || echo "{}")
     
-    # Extract version based on buildpack type
-    buildpack_version=""
+    # Extract version based on buildpack type. For buildpack version we can extract from buildpack_filename. 
+    # The grep -oP 'v\K[\d.]+' will extract the version number from the filename but may have a dangling period or dash at the end.
+    # We need to remove these dangling characters if they exist.
+    buildpack_version=$(echo "$buildpack_filename" | grep -oP 'v\K[\d.]+' | sed 's/[-.]$//' || echo "")
     runtime_version=""
     
     if [[ "$detected_buildpack" == *"java"* ]] || [[ "$detected_buildpack" == *"Java"* ]]; then
@@ -39,7 +42,7 @@ get_version_info() {
 }
 
 
-echo "Org_Name,Space_Name,Created_At,Updated_At,Name,GUID,Instances,Memory,Disk_Quota,Requested_Buildpack,Detected_Buildpack,Buikdpack_Version, Runtime_Version, HealthCheckType,App_State,Stack_Name,Services,Routes,Developers"
+echo "Org_Name,Space_Name,Created_At,Updated_At,Name,GUID,Instances,Memory,Disk_Quota,Requested_Buildpack,Detected_Buildpack,Detected_Buildpack_GUID, Buildpack_Filename, Buildpack_Version, Runtime_Version, DropletSizeBytes, PackagesSizeBytes, HealthCheckType,App_State,Stack_Name,Services,Routes,Developers"
 
 # Function to process a single app
 process_app() {
@@ -53,9 +56,17 @@ process_app() {
     disk_quota=$(echo "$app" | jq -r '.entity.disk_quota')
     buildpack=$(echo "$app" | jq -r '.entity.buildpack')
     detected_buildpack=$(echo "$app" | jq -r '.entity.detected_buildpack')
-    
-    version_info=$(get_version_info "$app_guid" "$detected_buildpack")
-    IFS='|' read -r buildpack_version runtime_version <<< "$version_info"
+    detected_buildpack_guid=$(echo "$app" | jq -r '.entity.detected_buildpack_guid')
+
+    # Now we get the app's droplet and package sizes. We will need to use v3 as that uses the app GUID directly.
+    # We will need to strip the http://<domain> and retain anything after the /v3 to use with cf curl.
+    droplet_download_link=$(cf curl "/v3/apps/${app_guid}/droplets" | jq -r '.resources[0].links.download.href' | sed 's|http[s]*://[^/]*||')
+    packages_download_link=$(cf curl "/v3/apps/${app_guid}/packages" | jq -r '.resources[0].links.download.href'| sed 's|http[s]*://[^/]*||')
+
+    # Get the droplet size and package size. This is done via cf curl but with -X HEAD and -v to avoid downloading the content.
+    # the size is in the Content-Length header of the response section.
+    droplet_size_bytes=$(cf curl -X HEAD -v "$droplet_download_link" 2>&1 | grep -i 'Content-Length:' | awk '{print $2}' | tr -d '\r')
+    packages_size_bytes=$(cf curl -X HEAD -v "$packages_download_link" 2>&1 | grep -i 'Content-Length:' | awk '{print $2}' | tr -d '\r')
 
     health_check="$(echo "$app" | jq -r '.entity.health_check_type')"
     app_state=$(echo "$app" | jq -r '.entity.state')
@@ -68,6 +79,40 @@ process_app() {
     created_at=$(echo "$app" | jq -r '.metadata.created_at')
     updated_at=$(echo "$app" | jq -r '.metadata.updated_at')
     routes_url=$(echo "$app" | jq -r '.entity.routes_url')
+
+    buildpack_filename=""
+    if [[ "$detected_buildpack_guid" == "null" ]]; then
+        # if detected_buildpack_guid is null, we grab the list of buildpacks via /v2/buildpacks.  We filter the name of the buildpack based on either
+        # the detected_buildpack or the buildpack name. We obtain the filename of the buildpack from the list. If there are more multiple filenames ,e.g. due to cflinux stack, concatenate them.      
+        if [[ -n "$detected_buildpack" ]]; then
+            input="$detected_buildpack"
+        else
+            input="$buildpack"
+        fi
+        
+        # use the stack name to help select the correct buildpack filename if there are multiple buildpacks with the same name.
+        # If the stack name is not available (blank or null), we will just get the first matching buildpack filename
+        if [[ -z "$stack_name" || "$stack_name" == "null" ]]; then
+            buildpack_filename=$(cf curl "/v2/buildpacks?results-per-page=100" | jq -r --arg buildpack "$input" '.resources[] | select(.entity.name == $buildpack) | .entity.filename' | head -n 1)
+        else
+            buildpack_filename=$(cf curl "/v2/buildpacks?results-per-page=100" | jq -r --arg buildpack "$input" '.resources[] | select(.entity.name == $buildpack) | .entity.filename' | grep -i "$stack_name" | head -n 1)
+        
+    else
+        # if detected_buildpack_guid is not null, we can use it to get the buildpack filename directly.
+        buildpack_filename=$(cf curl "/v2/buildpacks/${detected_buildpack_guid}" | jq -r '.entity.filename')
+    fi
+    
+    # Now we can extract the buildpack version and runtime version.
+    # We will use the get_version_info function defined above.
+    # This function will return the buildpack version and runtime version based on the detected_buildpack
+    # and the app_guid. We will also use the buikdpack_filename to help identify the buildpack version.
+    # If the buildpack version is not available, we will just return an empty string.
+    # If the runtime version is not available, we will just return an empty string.
+
+    version_info=$(get_version_info "$app_guid" "$detected_buildpack" "$buildpack_filename")
+    IFS='|' read -r buildpack_version runtime_version <<< "$version_info"
+
+
     service_binding_url=$(echo "$app" | jq -r '.entity.service_bindings_url')
 
     # Get all services bound to the app
@@ -101,7 +146,7 @@ process_app() {
     done < <(cf curl "${space_url}/developers" | jq '.resources[].entity | select(.username != null) | .username')
 
     # Output Data
-    echo "$org_name, $space_name, $created_at, $updated_at, $name, $app_guid, $instances, $memory, $disk_quota, $buildpack, $detected_buildpack,$buildpack_version, $runtime_version, $health_check, $app_state, $stack_name, $services, $routes, $dev_usernames"  
+    echo "$org_name, $space_name, $created_at, $updated_at, $name, $app_guid, $instances, $memory, $disk_quota, $buildpack, $detected_buildpack, $detected_buildpack_guid, $buildpack_filename, $buildpack_version, $runtime_version, $droplet_size_bytes, $packages_size_bytes, $health_check, $app_state, $stack_name, $services, $routes, $dev_usernames"  
 }
 
 export -f process_app
