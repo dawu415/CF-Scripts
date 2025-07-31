@@ -53,72 +53,86 @@ process_app() {
     instances=$(echo "$app" | $JQ -r '.entity.instances')
     memory=$(echo "$app" | $JQ -r '.entity.memory')
     disk_quota=$(echo "$app" | $JQ -r '.entity.disk_quota')
-    buildpack=$(echo "$app" | $JQ -r '.entity.buildpack')
-    detected_buildpack=$(echo "$app" | $JQ -r '.entity.detected_buildpack')
-    detected_buildpack_guid=$(echo "$app" | $JQ -r '.entity.detected_buildpack_guid')
+    buildpack=$(echo "$app" | $JQ -r '.entity.buildpack // empty')
+    detected_buildpack=$(echo "$app" | $JQ -r '.entity.detected_buildpack // empty')
+    detected_buildpack_guid=$(echo "$app" | $JQ -r '.entity.detected_buildpack_guid // empty')
 
-    droplet_download_link=$($CF curl "/v3/apps/${app_guid}/droplets" | $JQ -r '.resources[0].links.download.href' | sed 's|http[s]*://[^/]*||')
-    packages_download_link=$($CF curl "/v3/apps/${app_guid}/packages" | $JQ -r '.resources[0].links.download.href' | sed 's|http[s]*://[^/]*||')
+    # Safe droplet link
+    droplet_download_link=$($CF curl "/v3/apps/${app_guid}/droplets" | \
+        $JQ -r '.resources // [] | .[0].links.download.href // empty' | \
+        sed 's|http[s]*://[^/]*||')
 
-    droplet_size_bytes=$($CF curl -X HEAD -v "$droplet_download_link" 2>&1 | grep -i 'Content-Length:' | awk '{print $2}' | tr -d '\r')
-    packages_size_bytes=$($CF curl -X HEAD -v "$packages_download_link" 2>&1 | grep -i 'Content-Length:' | awk '{print $2}' | tr -d '\r')
+    if [[ -n "$droplet_download_link" ]]; then
+        droplet_size_bytes=$($CF curl -X HEAD -v "$droplet_download_link" 2>&1 | grep -i 'Content-Length:' | awk '{print $2}' | tr -d '\r')
+    else
+        droplet_size_bytes=""
+    fi
 
-    health_check=$($JQ -r '.entity.health_check_type' <<< "$app")
-    app_state=$($JQ -r '.entity.state' <<< "$app")
-    stack_name=$($CF curl "$($JQ -r '.entity.stack_url' <<< "$app")" | $JQ -r '.entity.name')
+    # Safe packages link
+    packages_download_link=$($CF curl "/v3/apps/${app_guid}/packages" | \
+        $JQ -r '.resources // [] | .[0].links.download.href // empty' | \
+        sed 's|http[s]*://[^/]*||')
 
-    space_url=$($JQ -r '.entity.space_url' <<< "$app")
+    if [[ -n "$packages_download_link" ]]; then
+        packages_size_bytes=$($CF curl -X HEAD -v "$packages_download_link" 2>&1 | grep -i 'Content-Length:' | awk '{print $2}' | tr -d '\r')
+    else
+        packages_size_bytes=""
+    fi
+
+    health_check=$($JQ -r '.entity.health_check_type // empty' <<< "$app")
+    app_state=$($JQ -r '.entity.state // empty' <<< "$app")
+    stack_url=$($JQ -r '.entity.stack_url // empty' <<< "$app")
+    stack_name=$([[ -n "$stack_url" ]] && $CF curl "$stack_url" | $JQ -r '.entity.name' || echo "")
+    space_url=$($JQ -r '.entity.space_url // empty' <<< "$app")
     space_json=$($CF curl "$space_url")
-    space_name=$(echo "$space_json" | $JQ -r '.entity.name')
-    org_url=$(echo "$space_json" | $JQ -r '.entity.organization_url')
-    org_name=$($CF curl "$org_url" | $JQ -r '.entity.name')
-
-    created_at=$($JQ -r '.metadata.created_at' <<< "$app")
-    updated_at=$($JQ -r '.metadata.updated_at' <<< "$app")
-
-    routes_url=$($JQ -r '.entity.routes_url' <<< "$app")
+    space_name=$(echo "$space_json" | $JQ -r '.entity.name // empty')
+    org_url=$(echo "$space_json" | $JQ -r '.entity.organization_url // empty')
+    org_name=$([[ -n "$org_url" ]] && $CF curl "$org_url" | $JQ -r '.entity.name // empty' || echo "")
+    created_at=$($JQ -r '.metadata.created_at // empty' <<< "$app")
+    updated_at=$($JQ -r '.metadata.updated_at // empty' <<< "$app")
+    routes_url=$($JQ -r '.entity.routes_url // empty' <<< "$app")
 
     buildpack_filename=""
-    if [[ "$detected_buildpack_guid" == "null" ]]; then
+    if [[ "$detected_buildpack_guid" == "null" || -z "$detected_buildpack_guid" ]]; then
         input="${detected_buildpack:-$buildpack}"
 
         if [[ -z "$stack_name" || "$stack_name" == "null" ]]; then
-            buildpack_filename=$($CF curl "/v2/buildpacks?results-per-page=100" | $JQ -r --arg buildpack "$input" '.resources[] | select(.entity.name == $buildpack) | .entity.filename' | head -n 1)
+            buildpack_filename=$($CF curl "/v2/buildpacks?results-per-page=100" | $JQ -r --arg buildpack "$input" '.resources // [] | .[] | select(.entity.name == $buildpack) | .entity.filename' | head -n 1)
         else
-            buildpack_filename=$($CF curl "/v2/buildpacks?results-per-page=100" | $JQ -r --arg buildpack "$input" '.resources[] | select(.entity.name == $buildpack) | .entity.filename' | grep -i "$stack_name" | head -n 1)
+            buildpack_filename=$($CF curl "/v2/buildpacks?results-per-page=100" | $JQ -r --arg buildpack "$input" '.resources // [] | .[] | select(.entity.name == $buildpack) | .entity.filename' | grep -i "$stack_name" | head -n 1)
         fi
     else
-        buildpack_filename=$($CF curl "/v2/buildpacks/${detected_buildpack_guid}" | $JQ -r '.entity.filename')
+        buildpack_filename=$($CF curl "/v2/buildpacks/${detected_buildpack_guid}" | $JQ -r '.entity.filename // empty')
     fi
 
     version_info=$(get_version_info "$app_guid" "$detected_buildpack" "$buildpack_filename")
     IFS='|' read -r buildpack_version runtime_version <<< "$version_info"
 
-    service_binding_url=$($JQ -r '.entity.service_bindings_url' <<< "$app")
+    service_binding_url=$($JQ -r '.entity.service_bindings_url // empty' <<< "$app")
 
-    services=$($CF curl "$service_binding_url" | $JQ -r -c '.resources[].entity.service_instance_url' | while read -r service_instance_url; do
+    services=$($CF curl "$service_binding_url" | $JQ -r '.resources // [] | .[] | .entity.service_instance_url' | while read -r service_instance_url; do
         data="$($CF curl "$service_instance_url")"
         if [[ "$service_instance_url" == *"user_provided_service"* ]]; then
-            service_name=$(echo "$data" | $JQ -r '.entity.name')
-            service_plan=$(echo "$data" | $JQ -r '.entity.type')
+            service_name=$(echo "$data" | $JQ -r '.entity.name // empty')
+            service_plan=$(echo "$data" | $JQ -r '.entity.type // empty')
         else
-            service_url=$(echo "$data" | $JQ -r '.entity.service_url')
-            service_plan_url=$(echo "$data" | $JQ -r '.entity.service_plan_url')
-            service_name=$($CF curl "$service_url" | $JQ -r '.entity.service_broker_name')
-            service_plan=$($CF curl "$service_plan_url" | $JQ -r '.entity.name')
+            service_url=$(echo "$data" | $JQ -r '.entity.service_url // empty')
+            service_plan_url=$(echo "$data" | $JQ -r '.entity.service_plan_url // empty')
+            service_name=$([[ -n "$service_url" ]] && $CF curl "$service_url" | $JQ -r '.entity.service_broker_name // empty' || echo "")
+            service_plan=$([[ -n "$service_plan_url" ]] && $CF curl "$service_plan_url" | $JQ -r '.entity.name // empty' || echo "")
         fi
         echo "${service_name} (${service_plan})"
     done | paste -sd ":" -)
 
-    routes=$($CF curl "$routes_url" | $JQ -c '.resources[]' | while read -r routedata; do
-        route_name=$(echo "$routedata" | $JQ -r '.entity.host')
-        domain_url=$(echo "$routedata" | $JQ -r '.entity.domain_url')
-        domain_name=$($CF curl "$domain_url" | $JQ -r '.entity.name')
+    routes=$($CF curl "$routes_url" | $JQ -c '.resources // [] | .[]' | while read -r routedata; do
+        route_name=$(echo "$routedata" | $JQ -r '.entity.host // empty')
+        domain_url=$(echo "$routedata" | $JQ -r '.entity.domain_url // empty')
+        domain_name=$([[ -n "$domain_url" ]] && $CF curl "$domain_url" | $JQ -r '.entity.name // empty' || echo "")
         echo "${route_name}.${domain_name}"
     done | paste -sd ":" -)
 
     dev_usernames=$($CF curl "${space_url}/developers" | \
-        $JQ -r '.resources[].entity | select(.username != null) | .username' | \
+        $JQ -r '.resources // [] | .[] | .entity | select(.username != null) | .username' | \
         paste -sd ":" -)
 
     echo "$org_name,$space_name,$created_at,$updated_at,$name,$app_guid,$instances,$memory,$disk_quota,$buildpack,$detected_buildpack,$detected_buildpack_guid,$buildpack_filename,$buildpack_version,$runtime_version,$droplet_size_bytes,$packages_size_bytes,$health_check,$app_state,$stack_name,$services,$routes,$dev_usernames"
@@ -131,7 +145,7 @@ echo "Org_Name,Space_Name,Created_At,Updated_At,Name,GUID,Instances,Memory,Disk_
 total_pages=$($CF curl "/v2/apps?results-per-page=100" | $JQ '.total_pages')
 
 for i in $(seq 1 $total_pages); do
-    app_list=$($CF curl "/v2/apps?page=$i&results-per-page=100" | $JQ -c '.resources[]')
+    app_list=$($CF curl "/v2/apps?page=$i&results-per-page=100" | $JQ -c '.resources // [] | .[]')
     while IFS= read -r app; do
         process_app "$app"
     done <<< "$app_list"
