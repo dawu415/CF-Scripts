@@ -1,3 +1,5 @@
+#!/bin/bash
+
 get_version_info() {
     local app_guid=$1
     local detected_buildpack=$2
@@ -97,7 +99,6 @@ process_app() {
         else
             buildpack_filename=$(cf curl "/v2/buildpacks?results-per-page=100" | jq -r --arg buildpack "$input" '.resources[] | select(.entity.name == $buildpack) | .entity.filename' | grep -i "$stack_name" | head -n 1)    
         fi
-               
     else
         # if detected_buildpack_guid is not null, we can use it to get the buildpack filename directly.
         buildpack_filename=$(cf curl "/v2/buildpacks/${detected_buildpack_guid}" | jq -r '.entity.filename')
@@ -117,8 +118,7 @@ process_app() {
     service_binding_url=$(echo "$app" | jq -r '.entity.service_bindings_url')
 
     # Get all services bound to the app
-    services=""
-    while read -r service_instance_url ; do
+    services=$(while read -r service_instance_url; do
         data="$(cf curl "$service_instance_url")"
         if [[ "$service_instance_url" == *"user_provided_service"* ]]; then
             service_name=$(echo "$data" | jq -r '.entity.name')
@@ -128,23 +128,23 @@ process_app() {
             service_plan_url=$(echo "$data" | jq -r '.entity.service_plan_url')
             service_name=$(cf curl "$service_url" | jq -r '.entity.service_broker_name')
             service_plan=$(cf curl "$service_plan_url" | jq -r '.entity.name')
-        fi  
-        services+="${service_name} (${service_plan}):"
-    done < <(cf curl "$service_binding_url" | jq -r -c '.resources[].entity.service_instance_url')  
+        fi
+        echo "${service_name} (${service_plan})"
+    done < <(cf curl "$service_binding_url" | jq -r -c '.resources[].entity.service_instance_url') \
+        | paste -sd ":" -)
 
     # Get all routes of the app
-    routes=""
-    while read -r routedata ; do
+    routes=$(cf curl "$routes_url" | jq -c '.resources[]' | while read -r routedata; do
         route_name=$(echo "$routedata" | jq -r '.entity.host')
-        domain_name=$(cf curl "$(echo "$routedata" | jq -r '.entity.domain_url')" | jq -r '.entity.name')
-        routes+="${route_name}.${domain_name}:"
-    done < <(cf curl "$routes_url" | jq -c '.resources[]')
+        domain_url=$(echo "$routedata" | jq -r '.entity.domain_url')
+        domain_name=$(cf curl "$domain_url" | jq -r '.entity.name')
+        echo "${route_name}.${domain_name}"
+    done | paste -sd ":" -)
 
     # Get all developers in the space
-    dev_usernames=""
-    while read -r dev_username ; do
-        dev_usernames+="${dev_username}:"
-    done < <(cf curl "${space_url}/developers" | jq '.resources[].entity | select(.username != null) | .username')
+    dev_usernames=$(cf curl "${space_url}/developers" | \
+        jq -r '.resources[].entity | select(.username != null) | .username' | \
+        paste -sd ":" -)
 
     # Output Data
     echo "$org_name, $space_name, $created_at, $updated_at, $name, $app_guid, $instances, $memory, $disk_quota, $buildpack, $detected_buildpack, $detected_buildpack_guid, $buildpack_filename, $buildpack_version, $runtime_version, $droplet_size_bytes, $packages_size_bytes, $health_check, $app_state, $stack_name, $services, $routes, $dev_usernames"  
