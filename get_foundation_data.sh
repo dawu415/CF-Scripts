@@ -1,8 +1,12 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -Eeuo pipefail
-trap 'ec=$?;
-      ts=$(date "+%F %T");
-      echo "[$ts] ERROR ${ec:-1} at ${BASH_SOURCE[0]}:${LINENO}: ${FUNCNAME[0]:-main}: ${BASH_COMMAND}" >&2;
+# Use a robust trap that works even if BASH_SOURCE or FUNCNAME are unset.
+# When the script is executed under shells that do not set BASH_SOURCE or
+# FUNCNAME (e.g. POSIX sh), fall back to $0 for the source file and
+# "main" for the function name.  This prevents "unbound variable" errors
+# when set -u is enabled.
+trap 'ec=$?; ts=$(date "+%F %T"); src="${BASH_SOURCE[0]:-$0}"; fn="${FUNCNAME[0]:-main}";
+      echo "[$ts] ERROR ${ec:-1} at ${src}:${LINENO}: ${fn}: ${BASH_COMMAND}" >&2;
       exit "${ec:-1}"' ERR
 
 # -----------------------------------------------------------------------------
@@ -125,18 +129,29 @@ export -f get_buildpack_filename
 # or `xargs`.
 
 fetch_all_pages_v2() {
+    # Fetch all pages from a v2 API endpoint.  CF v2 API has a maximum
+    # results-per-page of 100.  This helper will iterate through all pages
+    # by following the .next_url link and accumulate resources into a single
+    # JSON object.  If the base path already contains query parameters, the
+    # results-per-page parameter is appended with "&"; otherwise "?" is used.
     local base_path="$1"
-    local url="${base_path}?results-per-page=100"
+    local url="$base_path"
+    if [[ "$url" == *"?"* ]]; then
+        url="${url}&results-per-page=100"
+    else
+        url="${url}?results-per-page=100"
+    fi
     local acc='{ "resources": [] }'
     local resp next_url
     while [[ -n "$url" ]]; do
         resp=$(cf curl "$url" 2>/dev/null || echo '{}')
-        # Merge the resources from this page into our accumulator.  Using
-        # the "+" operator to produce a new object avoids jq's complaint
-        # about assigning to a variable property.  See
-        # https://stackoverflow.com/q/41439484 for details.
-        acc=$(jq -n --argjson acc "$acc" --argjson res "$resp" \
-            '$acc + {resources: ($acc.resources + ($res.resources // []))}')
+        # Merge the resources from this page into our accumulator.  Rather
+        # than passing the entire accumulator via --argjson (which can
+        # exceed the shell's argument length limit for large foundations),
+        # read it from stdin.  Use the + operator to append the new page's
+        # resources to the existing array.  If res.resources is empty or
+        # missing, default to an empty array.
+        acc=$(jq --argjson res "$resp" '.resources += ($res.resources // [])' <<<"$acc")
         # Determine the next URL.  The API returns a relative path; cf curl
         # accepts relative paths directly.  Empty string means no more pages.
         next_url=$(echo "$resp" | jq -r '.next_url // empty')
@@ -149,6 +164,41 @@ fetch_all_pages_v2() {
     echo "$acc"
 }
 export -f fetch_all_pages_v2
+
+#
+# fetch_all_pages_v3 - Iterate through pages of a v3 API endpoint.
+#
+# Cloud Foundry v3 APIs paginate results using `page` and `per_page` query
+# parameters and return a `pagination.next.href` field containing the URL
+# of the next page.  This helper will follow the `next` links until they
+# are empty, accumulating all `resources` arrays into a single JSON
+# object.  The resulting JSON has the same top-level structure as a
+# single page but contains all resources.  The caller must include
+# `per_page=...` and any other query parameters in the initial path.
+fetch_all_pages_v3() {
+    local url="$1"
+    local acc='{ "resources": [] }'
+    local resp next_url
+    while [[ -n "$url" ]]; do
+        resp=$(cf curl "$url" 2>/dev/null || echo '{}')
+        # Merge resources from this page into the accumulator using jq.  Read
+        # the existing accumulator from stdin instead of passing it as an
+        # argument to avoid exceeding the shell's argument length.  Append
+        # the current page's resources (if any) to the accumulated array.
+        acc=$(jq --argjson res "$resp" '.resources += ($res.resources // [])' <<<"$acc")
+        # Determine the next URL from the pagination.next.href field.  If
+        # empty, break the loop.  next_url may be an absolute URL; cf curl
+        # accepts both absolute and relative paths.
+        next_url=$(echo "$resp" | jq -r '.pagination.next.href // empty')
+        if [[ -n "$next_url" ]]; then
+            url="$next_url"
+        else
+            url=""
+        fi
+    done
+    echo "$acc"
+}
+export -f fetch_all_pages_v3
 
 # Fetch all spaces, organisations and stacks once at startup.  These JSON
 # blobs are exported so they are available to each worker process spawned by
