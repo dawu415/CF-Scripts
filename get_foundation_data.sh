@@ -2,14 +2,13 @@
 set -Eeuo pipefail
 [ -n "${BASH_VERSION:-}" ] || exec /usr/bin/env bash "$0" "$@"
 
-# Quiet any accidental interactive bits
+# Make runs deterministic and non-interactive
 export CF_COLOR=false CF_TRACE=false TERM=dumb
-# no stdin (prevents stty noise if anything slips through)
-exec </dev/null
-# best-effort to silence stray stty calls from profiles
+exec </dev/null  # no stdin for any sub-process
+# If some stray profile still runs stty, silence it
 stty -g >/dev/null 2>&1 || true
 
-# ---------- robust error trap ----------
+# ---------- robust error reporting ----------
 on_error() {
   local ec=$?; set +u
   local ts; ts=$(date "+%F %T" 2>/dev/null) || ts="N/A"
@@ -21,19 +20,17 @@ on_error() {
 }
 trap on_error ERR
 
-# ---------- temp workspace for caches (file paths only; tiny env) ----------
+# ---------- small temp workspace; keep only file paths in env ----------
 TMP_ROOT="${TMPDIR:-/tmp}"
 WORK_DIR="$(mktemp -d "${TMP_ROOT%/}/cf_collect.XXXXXX")"
 cleanup() { rm -rf "$WORK_DIR"; }
 trap cleanup EXIT
 
-# ---------- pagination helpers ----------
+# ---------- helpers: pagination ----------
 fetch_all_pages_v2() {
-  local base_path="$1"
-  local url
-  if [[ "$base_path" == *"?"* ]]; then url="${base_path}&results-per-page=100"; else url="${base_path}?results-per-page=100"; fi
-  local acc='{ "resources": [] }'
-  local resp next_url
+  local base="$1" url acc resp next_url
+  if [[ "$base" == *"?"* ]]; then url="${base}&results-per-page=100"; else url="${base}?results-per-page=100"; fi
+  acc='{ "resources": [] }'
   while [[ -n "$url" ]]; do
     resp=$(cf curl "$url" 2>/dev/null || echo '{}')
     acc=$(jq --argjson res "$resp" '.resources += ($res.resources // [])' <<<"$acc")
@@ -44,9 +41,8 @@ fetch_all_pages_v2() {
 }
 
 fetch_all_pages_v3() {
-  local url="$1"
-  local acc='{ "resources": [] }'
-  local resp next_url
+  local url="$1" acc resp next_url
+  acc='{ "resources": [] }'
   while [[ -n "$url" ]]; do
     resp=$(cf curl "$url" 2>/dev/null || echo '{}')
     acc=$(jq --argjson res "$resp" '.resources += ($res.resources // [])' <<<"$acc")
@@ -59,35 +55,38 @@ fetch_all_pages_v3() {
 export -f fetch_all_pages_v2
 export -f fetch_all_pages_v3
 
-# ---------- buildpacks cache (file) ----------
+# ---------- caches on disk ----------
 BUILDPACKS_JSON_FILE="$WORK_DIR/buildpacks.json"
-cf curl "/v2/buildpacks?results-per-page=100" 2>/dev/null >"$BUILDPACKS_JSON_FILE" || echo '{}' >"$BUILDPACKS_JSON_FILE"
+SPACES_JSON_FILE="$WORK_DIR/spaces.json"
+ORGS_JSON_FILE="$WORK_DIR/orgs.json"
+STACKS_JSON_FILE="$WORK_DIR/stacks.json"
 
+cf curl "/v2/buildpacks?results-per-page=100" 2>/dev/null >"$BUILDPACKS_JSON_FILE" || echo '{}' >"$BUILDPACKS_JSON_FILE"
+fetch_all_pages_v2 "/v2/spaces"        >"$SPACES_JSON_FILE"
+fetch_all_pages_v2 "/v2/organizations" >"$ORGS_JSON_FILE"
+fetch_all_pages_v2 "/v2/stacks"        >"$STACKS_JSON_FILE"
+
+export BUILDPACKS_JSON_FILE SPACES_JSON_FILE ORGS_JSON_FILE STACKS_JSON_FILE WORK_DIR
+
+# ---------- buildpack helpers ----------
 get_buildpack_filename() {
   local bp_key="$1" stack_name="${2:-}"
-  if [[ "$bp_key" =~ ^[0-9a-fA-F-]{36}$ ]]; then
-    jq -r --arg guid "$bp_key" '.resources[]? | select(.metadata.guid == $guid) | .entity.filename // empty' "$BUILDPACKS_JSON_FILE" | head -n 1
-  else
-    if [[ -z "$stack_name" || "$stack_name" == "null" ]]; then
-      jq -r --arg name "$bp_key" '.resources[]? | select(.entity.name == $name) | .entity.filename // empty' "$BUILDPACKS_JSON_FILE" | head -n 1
+  if [[ -s "$BUILDPACKS_JSON_FILE" ]]; then
+    if [[ "$bp_key" =~ ^[0-9a-fA-F-]{36}$ ]]; then
+      jq -r --arg guid "$bp_key" '.resources[]? | select(.metadata.guid == $guid) | .entity.filename // empty' "$BUILDPACKS_JSON_FILE" | head -n 1
     else
-      jq -r --arg name "$bp_key" '.resources[]? | select(.entity.name == $name) | .entity.filename // empty' "$BUILDPACKS_JSON_FILE" \
-      | grep -i "$stack_name" | head -n 1
+      if [[ -z "$stack_name" || "$stack_name" == "null" ]]; then
+        jq -r --arg name "$bp_key" '.resources[]? | select(.entity.name == $name) | .entity.filename // empty' "$BUILDPACKS_JSON_FILE" | head -n 1
+      else
+        jq -r --arg name "$bp_key" '.resources[]? | select(.entity.name == $name) | .entity.filename // empty' "$BUILDPACKS_JSON_FILE" | grep -i "$stack_name" | head -n 1
+      fi
     fi
+  else
+    echo ""   # no cache -> blank
   fi
 }
 export -f get_buildpack_filename
 
-# ---------- spaces / orgs / stacks caches (files) ----------
-SPACES_JSON_FILE="$WORK_DIR/spaces.json"
-ORGS_JSON_FILE="$WORK_DIR/orgs.json"
-STACKS_JSON_FILE="$WORK_DIR/stacks.json"
-fetch_all_pages_v2 "/v2/spaces"        >"$SPACES_JSON_FILE"
-fetch_all_pages_v2 "/v2/organizations" >"$ORGS_JSON_FILE"
-fetch_all_pages_v2 "/v2/stacks"        >"$STACKS_JSON_FILE"
-export SPACES_JSON_FILE ORGS_JSON_FILE STACKS_JSON_FILE
-
-# ---------- version/runtime ----------
 get_version_info() {
   local app_guid=$1 detected_buildpack=$2 buildpack_filename=$3
   local env_data; env_data=$(cf curl "/v2/apps/${app_guid}/env" 2>/dev/null || echo "{}")
@@ -118,17 +117,47 @@ get_version_info() {
 }
 export -f get_version_info
 
-# ---------- service memoization (globals; exist even under set -u) ----------
+# ---------- service memoization ----------
 declare -A MANAGED_SERVICE_CACHE=()
 declare -A UPS_SERVICE_CACHE=()
 
 # ---------- CSV header ----------
 echo "Org_Name,Space_Name,Created_At,Updated_At,Name,GUID,Instances,Memory,Disk_Quota,Requested_Buildpack,Detected_Buildpack,Detected_Buildpack_GUID,Buildpack_Filename,Buildpack_Version,Runtime_Version,DropletSizeBytes,PackagesSizeBytes,HealthCheckType,App_State,Stack_Name,Services,Routes,Developers,Detected_Start_Command,Events"
 
+# ---------- tiny helpers to survive missing caches ----------
+get_stack_name_safe() {
+  local stack_url="$1" stack_guid="${stack_url##*/}"
+  if [[ -s "$STACKS_JSON_FILE" && -n "$stack_guid" && "$stack_guid" != "null" ]]; then
+    jq -r --arg gid "$stack_guid" '.resources[]? | select(.metadata.guid == $gid) | .entity.name // empty' "$STACKS_JSON_FILE"
+  else
+    cf curl "$stack_url" | jq -r '.entity.name // empty'
+  fi
+}
+
+get_space_org_names_safe() {
+  local space_url="$1" space_guid="${space_url##*/}"
+  local space_name="" org_guid="" org_name=""
+  if [[ -s "$SPACES_JSON_FILE" && -n "$space_guid" && "$space_guid" != "null" ]]; then
+    space_name=$(jq -r --arg gid "$space_guid" '.resources[]? | select(.metadata.guid == $gid) | .entity.name // empty' "$SPACES_JSON_FILE")
+    org_guid=$(jq -r  --arg gid "$space_guid" '.resources[]? | select(.metadata.guid == $gid) | .entity.organization_guid // empty' "$SPACES_JSON_FILE")
+    if [[ -s "$ORGS_JSON_FILE" && -n "$org_guid" && "$org_guid" != "null" ]]; then
+      org_name=$(jq -r --arg gid "$org_guid" '.resources[]? | select(.metadata.guid == $gid) | .entity.name // empty' "$ORGS_JSON_FILE")
+    else
+      org_name=$(cf curl "/v2/organizations/$org_guid" | jq -r '.entity.name // empty')
+    fi
+  else
+    local space_json; space_json=$(cf curl "$space_url")
+    space_name=$(echo "$space_json" | jq -r '.entity.name // empty')
+    local org_url; org_url=$(echo "$space_json" | jq -r '.entity.organization_url // empty')
+    org_name=$(cf curl "$org_url" | jq -r '.entity.name // empty')
+  fi
+  printf '%s|%s\n' "$space_name" "$org_name"
+}
+
+# ---------- per-app ----------
 process_app() {
   local app="$1"
 
-  # Basic metadata
   local name app_guid instances memory disk_quota buildpack detected_buildpack detected_buildpack_guid
   name=$(echo "$app" | jq -r '.entity.name // empty')
   app_guid=$(echo "$app" | jq -r '.metadata.guid')
@@ -139,55 +168,29 @@ process_app() {
   detected_buildpack=$(echo "$app" | jq -r '.entity.detected_buildpack // empty')
   detected_buildpack_guid=$(echo "$app" | jq -r '.entity.detected_buildpack_guid // empty')
 
-  # Droplet & package sizes (HEAD only; needed for analysis)
-  local droplet_size_bytes="" packages_size_bytes=""
-  local droplet_download_link packages_download_link
-  droplet_download_link=$(cf curl "/v3/apps/${app_guid}/droplets" | jq -r '.resources // [] | .[0].links.download.href // empty' | sed 's|http[s]*://[^/]*||')
-  packages_download_link=$(cf curl "/v3/apps/${app_guid}/packages" | jq -r '.resources // [] | .[0].links.download.href // empty' | sed 's|http[s]*://[^/]*||')
-  if [[ -n "$droplet_download_link" ]]; then
-    droplet_size_bytes=$(cf curl -X HEAD -v "$droplet_download_link" 2>&1 | grep -i 'Content-Length:' | awk '{print $2}' | tr -d '\r' || true)
-  fi
-  if [[ -n "$packages_download_link" ]]; then
-    packages_size_bytes=$(cf curl -X HEAD -v "$packages_download_link" 2>&1 | grep -i 'Content-Length:' | awk '{print $2}' | tr -d '\r' || true)
-  fi
+  # Sizes (HEAD)
+  local droplet_size_bytes="" packages_size_bytes="" dl pl
+  dl=$(cf curl "/v3/apps/${app_guid}/droplets" | jq -r '.resources // [] | .[0].links.download.href // empty' | sed 's|http[s]*://[^/]*||')
+  pl=$(cf curl "/v3/apps/${app_guid}/packages" | jq -r '.resources // [] | .[0].links.download.href // empty' | sed 's|http[s]*://[^/]*||')
+  [[ -n "$dl" ]] && droplet_size_bytes=$(cf curl -X HEAD -v "$dl" 2>&1 | awk -F': ' '/Content-Length:/ {gsub(/\r/,"",$2); print $2; exit}')
+  [[ -n "$pl" ]] && packages_size_bytes=$(cf curl -X HEAD -v "$pl" 2>&1 | awk -F': ' '/Content-Length:/ {gsub(/\r/,"",$2); print $2; exit}')
 
-  # Health and state
   local health_check app_state
   health_check=$(echo "$app" | jq -r '.entity.health_check_type // empty')
   app_state=$(echo "$app" | jq -r '.entity.state // empty')
 
-  # Stack from cached file
-  local stack_url stack_guid stack_name
-  stack_url=$(echo "$app" | jq -r '.entity.stack_url // empty')
-  stack_guid="${stack_url##*/}"
-  if [[ -s "$STACKS_JSON_FILE" && -n "$stack_guid" && "$stack_guid" != "null" ]]; then
-    stack_name=$(jq -r --arg gid "$stack_guid" '.resources[]? | select(.metadata.guid == $gid) | .entity.name // empty' "$STACKS_JSON_FILE")
-  else
-    stack_name=""
-  fi
+  local stack_url stack_name; stack_url=$(echo "$app" | jq -r '.entity.stack_url // empty')
+  stack_name=$(get_stack_name_safe "$stack_url")
 
-  # Space & org names from cached files
-  local space_url space_guid space_name org_guid org_name
+  local space_url space_name org_name
   space_url=$(echo "$app" | jq -r '.entity.space_url // empty')
-  space_guid="${space_url##*/}"
-  if [[ -s "$SPACES_JSON_FILE" && -n "$space_guid" && "$space_guid" != "null" ]]; then
-    space_name=$(jq -r --arg gid "$space_guid" '.resources[]? | select(.metadata.guid == $gid) | .entity.name // empty' "$SPACES_JSON_FILE")
-    org_guid=$(jq -r --arg gid "$space_guid" '.resources[]? | select(.metadata.guid == $gid) | .entity.organization_guid // empty' "$SPACES_JSON_FILE")
-  else
-    space_name=""; org_guid=""
-  fi
-  if [[ -s "$ORGS_JSON_FILE" && -n "$org_guid" && "$org_guid" != "null" ]]; then
-    org_name=$(jq -r --arg gid "$org_guid" '.resources[]? | select(.metadata.guid == $gid) | .entity.name // empty' "$ORGS_JSON_FILE")
-  else
-    org_name=""
-  fi
+  IFS='|' read -r space_name org_name < <(get_space_org_names_safe "$space_url")
 
   local created_at updated_at detected_start_command
   created_at=$(echo "$app" | jq -r '.metadata.created_at // empty')
   updated_at=$(echo "$app" | jq -r '.metadata.updated_at // empty')
   detected_start_command=$(echo "$app" | jq -r '.entity.detected_start_command // empty')
 
-  # Buildpack filename via cache
   local buildpack_filename input
   if [[ "$detected_buildpack_guid" != "null" && -n "$detected_buildpack_guid" ]]; then
     buildpack_filename=$(get_buildpack_filename "$detected_buildpack_guid")
@@ -196,24 +199,21 @@ process_app() {
     buildpack_filename=$(get_buildpack_filename "$input" "$stack_name")
   fi
 
-  local version_info buildpack_version runtime_version
-  version_info=$(get_version_info "$app_guid" "$detected_buildpack" "$buildpack_filename")
-  IFS='|' read -r buildpack_version runtime_version <<< "$version_info"
+  local buildpack_version runtime_version
+  IFS='|' read -r buildpack_version runtime_version <<<"$(get_version_info "$app_guid" "$detected_buildpack" "$buildpack_filename")"
 
-  # Routes & services from summary
-  local summary_json routes services
+  local summary_json routes
   summary_json=$(cf curl "/v2/apps/${app_guid}/summary" 2>/dev/null || echo '{}')
   routes=$(echo "$summary_json" | jq -r '.routes // [] | .[] | "\(.host).\(.domain.name)"' | paste -sd ':' -)
 
-  # Memoize services (managed globally; UPS per space)
+  # Services with memoization
   local -a services_list=()
   local svc service_guid service_type service_string label plan name up_key
-  # compact rows with only what we need
   while IFS= read -r svc; do
     service_guid=$(echo "$svc" | jq -r '.guid')
     service_type=$(echo "$svc" | jq -r '.type')
 
-    # skip if GUID is empty/null to avoid "bad array subscript"
+    # Skip if GUID is empty/null to avoid "bad array subscript"
     if [[ -z "$service_guid" || "$service_guid" == "null" ]]; then
       continue
     fi
@@ -228,7 +228,7 @@ process_app() {
         MANAGED_SERVICE_CACHE["$service_guid"]="$service_string"
       fi
     else
-      up_key="${space_guid}:${service_guid}"
+      up_key="$(basename "$space_url"):${service_guid}"
       if [[ ${UPS_SERVICE_CACHE["$up_key"]+_} ]]; then
         service_string="${UPS_SERVICE_CACHE[$up_key]}"
       else
@@ -237,46 +237,37 @@ process_app() {
         UPS_SERVICE_CACHE["$up_key"]="$service_string"
       fi
     fi
-
     services_list+=("$service_string")
   done < <(echo "$summary_json" | jq -c '.services // [] | .[]')
 
+  local services=""
   if (( ${#services_list[@]} > 0 )); then
     services=$(printf "%s:" "${services_list[@]}"); services="${services%:}"
-  else
-    services=""
   fi
   routes=${routes:-""}; services=${services:-""}
 
-  # Developers
   local dev_usernames
   dev_usernames=$(cf curl "${space_url}/developers" | jq -r '.resources // [] | .[] | .entity | select(.username != null) | .username' | paste -sd ':' -)
 
-  # Events (v2) as compact JSONs joined by :#:
   local events="" events_url events_json
   events_url=$(echo "$app" | jq -r '.entity.events_url // empty')
   if [[ -n "$events_url" ]]; then
     events_json=$(fetch_all_pages_v2 "$events_url")
     events=$(echo "$events_json" | jq -cr '.resources[]?' | paste -sd ':#:' -)
-    events=${events:-""}
   fi
 
   echo "$org_name,$space_name,$created_at,$updated_at,$name,$app_guid,$instances,$memory,$disk_quota,$buildpack,$detected_buildpack,$detected_buildpack_guid,$buildpack_filename,$buildpack_version,$runtime_version,$droplet_size_bytes,$packages_size_bytes,$health_check,$app_state,$stack_name,$services,$routes,$dev_usernames,$detected_start_command,$events"
 }
 export -f process_app
 
-# ---------- drive the listing ----------
+# ---------- drive it (force bash --noprofile/--norc for workers) ----------
 total_pages=$(cf curl "/v2/apps?results-per-page=100" | jq '.total_pages // 1')
 
+WORKERS="${WORKERS:-6}"   # change with: WORKERS=10 ./inf.sh
+
 for i in $(seq 1 "$total_pages"); do
-  if command -v parallel >/dev/null 2>&1; then
-    cf curl "/v2/apps?page=$i&results-per-page=100" \
-      | jq -c '.resources // [] | .[]' \
-      | parallel -j 10 process_app
-  else
-    cf curl "/v2/apps?page=$i&results-per-page=100" \
-      | jq -c '.resources // [] | .[]' \
-      | while IFS= read -r app; do printf '%s\0' "$app"; done \
-      | xargs -0 -P 6 -I {} bash -lc 'process_app "$@"' _ {}
-  fi
+  cf curl "/v2/apps?page=$i&results-per-page=100" \
+    | jq -c '.resources // [] | .[]' \
+    | while IFS= read -r app; do printf '%s\0' "$app"; done \
+    | xargs -0 -P "$WORKERS" -I {} bash --noprofile --norc -lc 'process_app "$@"' _ {}
 done
