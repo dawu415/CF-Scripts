@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+# Ensure we are actually running in bash (not /bin/sh)
 [ -n "${BASH_VERSION:-}" ] || exec /usr/bin/env bash "$0" "$@"
 
-# Make runs deterministic and non-interactive
+# Non-interactive; avoid profile noise (e.g., stty) and colored output
 export CF_COLOR=false CF_TRACE=false TERM=dumb
-exec </dev/null  # no stdin for any sub-process
-# If some stray profile still runs stty, silence it
+exec </dev/null
 stty -g >/dev/null 2>&1 || true
 
-# ---------- robust error reporting ----------
+# ---- error trap that never dereferences unset arrays/vars ----
 on_error() {
   local ec=$?; set +u
   local ts; ts=$(date "+%F %T" 2>/dev/null) || ts="N/A"
@@ -20,13 +20,17 @@ on_error() {
 }
 trap on_error ERR
 
-# ---------- small temp workspace; keep only file paths in env ----------
+# ---- short-lived workspace; pass files to workers instead of giant env vars ----
 TMP_ROOT="${TMPDIR:-/tmp}"
 WORK_DIR="$(mktemp -d "${TMP_ROOT%/}/cf_collect.XXXXXX")"
-cleanup() { rm -rf "$WORK_DIR"; }
+cleanup(){ rm -rf "$WORK_DIR"; }
 trap cleanup EXIT
 
-# ---------- helpers: pagination ----------
+# -----------------------------------------------------------------------------
+# Your existing helper functions and logic (unchanged in spirit)
+# -----------------------------------------------------------------------------
+
+# v2 pagination (reads/returns full JSON)
 fetch_all_pages_v2() {
   local base="$1" url acc resp next_url
   if [[ "$base" == *"?"* ]]; then url="${base}&results-per-page=100"; else url="${base}?results-per-page=100"; fi
@@ -40,6 +44,7 @@ fetch_all_pages_v2() {
   echo "$acc"
 }
 
+# v3 pagination (reads/returns full JSON)
 fetch_all_pages_v3() {
   local url="$1" acc resp next_url
   acc='{ "resources": [] }'
@@ -52,10 +57,7 @@ fetch_all_pages_v3() {
   echo "$acc"
 }
 
-export -f fetch_all_pages_v2
-export -f fetch_all_pages_v3
-
-# ---------- caches on disk ----------
+# Cache JSON **to files** (workers read these paths; avoids "jq: could not open file")
 BUILDPACKS_JSON_FILE="$WORK_DIR/buildpacks.json"
 SPACES_JSON_FILE="$WORK_DIR/spaces.json"
 ORGS_JSON_FILE="$WORK_DIR/orgs.json"
@@ -66,27 +68,28 @@ fetch_all_pages_v2 "/v2/spaces"        >"$SPACES_JSON_FILE"
 fetch_all_pages_v2 "/v2/organizations" >"$ORGS_JSON_FILE"
 fetch_all_pages_v2 "/v2/stacks"        >"$STACKS_JSON_FILE"
 
-export BUILDPACKS_JSON_FILE SPACES_JSON_FILE ORGS_JSON_FILE STACKS_JSON_FILE WORK_DIR
-
-# ---------- buildpack helpers ----------
+# Look up buildpack filename from cache
 get_buildpack_filename() {
   local bp_key="$1" stack_name="${2:-}"
-  if [[ -s "$BUILDPACKS_JSON_FILE" ]]; then
-    if [[ "$bp_key" =~ ^[0-9a-fA-F-]{36}$ ]]; then
-      jq -r --arg guid "$bp_key" '.resources[]? | select(.metadata.guid == $guid) | .entity.filename // empty' "$BUILDPACKS_JSON_FILE" | head -n 1
-    else
-      if [[ -z "$stack_name" || "$stack_name" == "null" ]]; then
-        jq -r --arg name "$bp_key" '.resources[]? | select(.entity.name == $name) | .entity.filename // empty' "$BUILDPACKS_JSON_FILE" | head -n 1
-      else
-        jq -r --arg name "$bp_key" '.resources[]? | select(.entity.name == $name) | .entity.filename // empty' "$BUILDPACKS_JSON_FILE" | grep -i "$stack_name" | head -n 1
-      fi
-    fi
+  [[ -s "$BUILDPACKS_JSON_FILE" ]] || { echo ""; return; }
+  if [[ "$bp_key" =~ ^[0-9a-fA-F-]{36}$ ]]; then
+    jq -r --arg guid "$bp_key" \
+      '.resources[]? | select(.metadata.guid == $guid) | .entity.filename // empty' \
+      "$BUILDPACKS_JSON_FILE" | head -n 1
   else
-    echo ""   # no cache -> blank
+    if [[ -z "$stack_name" || "$stack_name" == "null" ]]; then
+      jq -r --arg name "$bp_key" \
+        '.resources[]? | select(.entity.name == $name) | .entity.filename // empty' \
+        "$BUILDPACKS_JSON_FILE" | head -n 1
+    else
+      jq -r --arg name "$bp_key" \
+        '.resources[]? | select(.entity.name == $name) | .entity.filename // empty' \
+        "$BUILDPACKS_JSON_FILE" | grep -i "$stack_name" | head -n 1
+    fi
   fi
 }
-export -f get_buildpack_filename
 
+# Extract versions (unchanged logic; portable regex)
 get_version_info() {
   local app_guid=$1 detected_buildpack=$2 buildpack_filename=$3
   local env_data; env_data=$(cf curl "/v2/apps/${app_guid}/env" 2>/dev/null || echo "{}")
@@ -115,16 +118,8 @@ get_version_info() {
   [[ -z "$runtime_version"   || "$runtime_version"   == "null" ]] && runtime_version=""
   echo "${buildpack_version}|${runtime_version}"
 }
-export -f get_version_info
 
-# ---------- service memoization ----------
-declare -A MANAGED_SERVICE_CACHE=()
-declare -A UPS_SERVICE_CACHE=()
-
-# ---------- CSV header ----------
-echo "Org_Name,Space_Name,Created_At,Updated_At,Name,GUID,Instances,Memory,Disk_Quota,Requested_Buildpack,Detected_Buildpack,Detected_Buildpack_GUID,Buildpack_Filename,Buildpack_Version,Runtime_Version,DropletSizeBytes,PackagesSizeBytes,HealthCheckType,App_State,Stack_Name,Services,Routes,Developers,Detected_Start_Command,Events"
-
-# ---------- tiny helpers to survive missing caches ----------
+# Safe lookups using the file caches (fallbacks keep prior behavior)
 get_stack_name_safe() {
   local stack_url="$1" stack_guid="${stack_url##*/}"
   if [[ -s "$STACKS_JSON_FILE" && -n "$stack_guid" && "$stack_guid" != "null" ]]; then
@@ -154,7 +149,10 @@ get_space_org_names_safe() {
   printf '%s|%s\n' "$space_name" "$org_name"
 }
 
-# ---------- per-app ----------
+# CSV header
+echo "Org_Name,Space_Name,Created_At,Updated_At,Name,GUID,Instances,Memory,Disk_Quota,Requested_Buildpack,Detected_Buildpack,Detected_Buildpack_GUID,Buildpack_Filename,Buildpack_Version,Runtime_Version,DropletSizeBytes,PackagesSizeBytes,HealthCheckType,App_State,Stack_Name,Services,Routes,Developers,Detected_Start_Command,Events"
+
+# Per-app worker (no arithmetic on GUID-like strings; memo caches live inside each worker)
 process_app() {
   local app="$1"
 
@@ -168,7 +166,7 @@ process_app() {
   detected_buildpack=$(echo "$app" | jq -r '.entity.detected_buildpack // empty')
   detected_buildpack_guid=$(echo "$app" | jq -r '.entity.detected_buildpack_guid // empty')
 
-  # Sizes (HEAD)
+  # Droplet & package sizes via HEAD
   local droplet_size_bytes="" packages_size_bytes="" dl pl
   dl=$(cf curl "/v3/apps/${app_guid}/droplets" | jq -r '.resources // [] | .[0].links.download.href // empty' | sed 's|http[s]*://[^/]*||')
   pl=$(cf curl "/v3/apps/${app_guid}/packages" | jq -r '.resources // [] | .[0].links.download.href // empty' | sed 's|http[s]*://[^/]*||')
@@ -206,18 +204,17 @@ process_app() {
   summary_json=$(cf curl "/v2/apps/${app_guid}/summary" 2>/dev/null || echo '{}')
   routes=$(echo "$summary_json" | jq -r '.routes // [] | .[] | "\(.host).\(.domain.name)"' | paste -sd ':' -)
 
-  # Services with memoization
+  # Per-worker memo caches (safe use; skip empty GUIDs to avoid bad-subscript)
+  declare -A MANAGED_SERVICE_CACHE=()
+  declare -A UPS_SERVICE_CACHE=()
+
   local -a services_list=()
   local svc service_guid service_type service_string label plan name up_key
   while IFS= read -r svc; do
     service_guid=$(echo "$svc" | jq -r '.guid')
+    [[ -z "$service_guid" || "$service_guid" == "null" ]] && continue
+
     service_type=$(echo "$svc" | jq -r '.type')
-
-    # Skip if GUID is empty/null to avoid "bad array subscript"
-    if [[ -z "$service_guid" || "$service_guid" == "null" ]]; then
-      continue
-    fi
-
     if [[ "$service_type" != "user_provided_service_instance" ]]; then
       if [[ ${MANAGED_SERVICE_CACHE["$service_guid"]+_} ]]; then
         service_string="${MANAGED_SERVICE_CACHE[$service_guid]}"
@@ -244,6 +241,7 @@ process_app() {
   if (( ${#services_list[@]} > 0 )); then
     services=$(printf "%s:" "${services_list[@]}"); services="${services%:}"
   fi
+
   routes=${routes:-""}; services=${services:-""}
 
   local dev_usernames
@@ -258,16 +256,42 @@ process_app() {
 
   echo "$org_name,$space_name,$created_at,$updated_at,$name,$app_guid,$instances,$memory,$disk_quota,$buildpack,$detected_buildpack,$detected_buildpack_guid,$buildpack_filename,$buildpack_version,$runtime_version,$droplet_size_bytes,$packages_size_bytes,$health_check,$app_state,$stack_name,$services,$routes,$dev_usernames,$detected_start_command,$events"
 }
-export -f process_app
 
-# ---------- drive it (force bash --noprofile/--norc for workers) ----------
+# -----------------------------------------------------------------------------
+# Ship helpers to workers via a tiny library file, and stream app JSON via stdin
+# -----------------------------------------------------------------------------
+LIB_FILE="$WORK_DIR/lib.sh"
+{
+  typeset -f fetch_all_pages_v2
+  typeset -f fetch_all_pages_v3
+  typeset -f get_buildpack_filename
+  typeset -f get_version_info
+  typeset -f get_stack_name_safe
+  typeset -f get_space_org_names_safe
+  typeset -f process_app
+} > "$LIB_FILE"
+
+WORKER="$WORK_DIR/worker.sh"
+cat >"$WORKER" <<'WSH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'ec=$?; echo "[worker] error ${ec} at ${BASH_SOURCE[0]}:${LINENO}: ${BASH_COMMAND}" >&2; exit $ec' ERR
+source "$LIB_FILE"
+# Read one app JSON object from stdin and process it.
+app_json="$(cat)"
+process_app "$app_json"
+WSH
+chmod +x "$WORKER"
+
+export BUILDPACKS_JSON_FILE SPACES_JSON_FILE ORGS_JSON_FILE STACKS_JSON_FILE LIB_FILE WORKER
+
+# Drive it with xargs (null-delimited, stdin streaming to avoid argv limits)
 total_pages=$(cf curl "/v2/apps?results-per-page=100" | jq '.total_pages // 1')
-
-WORKERS="${WORKERS:-6}"   # change with: WORKERS=10 ./inf.sh
+WORKERS="${WORKERS:-6}"
 
 for i in $(seq 1 "$total_pages"); do
   cf curl "/v2/apps?page=$i&results-per-page=100" \
     | jq -c '.resources // [] | .[]' \
     | while IFS= read -r app; do printf '%s\0' "$app"; done \
-    | xargs -0 -P "$WORKERS" -I {} bash --noprofile --norc -lc 'process_app "$@"' _ {}
+    | xargs -0 -P "$WORKERS" -n 1 -I % bash -c 'printf "%s" "$1" | "$WORKER"' _ %
 done
