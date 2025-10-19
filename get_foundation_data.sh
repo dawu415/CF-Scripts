@@ -1,13 +1,32 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-# Use a robust trap that works even if BASH_SOURCE or FUNCNAME are unset.
-# When the script is executed under shells that do not set BASH_SOURCE or
-# FUNCNAME (e.g. POSIX sh), fall back to $0 for the source file and
-# "main" for the function name.  This prevents "unbound variable" errors
-# when set -u is enabled.
-trap 'ec=$?; ts=$(date "+%F %T"); src="${BASH_SOURCE[0]:-$0}"; fn="${FUNCNAME[0]:-main}";
-      echo "[$ts] ERROR ${ec:-1} at ${src}:${LINENO}: ${fn}: ${BASH_COMMAND}" >&2;
-      exit "${ec:-1}"' ERR
+
+# MUST be near the top, right after set -Eeuo pipefail
+[ -n "${BASH_VERSION:-}" ] || exec /usr/bin/env bash "$0" "$@"
+
+on_error() {
+  local ec=$?
+  local ts; ts=$(date "+%F %T") || ts="N/A"
+
+  # Relax nounset inside the handler so unset special arrays don’t explode
+  set +u
+
+  # Derive file/function safely (don’t index arrays unless present)
+  local src="$0"
+  if [ -n "${BASH_SOURCE-}" ] && [ "${#BASH_SOURCE[@]}" -gt 0 ]; then
+    src="${BASH_SOURCE[0]}"
+  fi
+  local fn="main"
+  if [ -n "${FUNCNAME-}" ] && [ "${#FUNCNAME[@]}" -gt 0 ]; then
+    fn="${FUNCNAME[0]}"
+  fi
+
+  local cmd="${BASH_COMMAND:-N/A}"
+  echo "[$ts] ERROR ${ec:-1} at ${src}:${LINENO}: ${fn}: ${cmd}" >&2
+  exit "${ec:-1}"
+}
+trap on_error ERR
+
 
 # -----------------------------------------------------------------------------
 # PERFORMANCE NOTE
@@ -71,7 +90,7 @@ get_version_info() {
     echo "${buildpack_version}|${runtime_version}"
 }
 
-echo "Org_Name,Space_Name,Created_At,Updated_At,Name,GUID,Instances,Memory,Disk_Quota,Requested_Buildpack,Detected_Buildpack,Detected_Buildpack_GUID,Buildpack_Filename,Buildpack_Version,Runtime_Version,DropletSizeBytes,PackagesSizeBytes,HealthCheckType,App_State,Stack_Name,Services,Routes,Developers,Detected_Start_Command, Events"
+echo "Org_Name,Space_Name,Created_At,Updated_At,Name,GUID,Instances,Memory,Disk_Quota,Requested_Buildpack,Detected_Buildpack,Detected_Buildpack_GUID,Buildpack_Filename,Buildpack_Version,Runtime_Version,DropletSizeBytes,PackagesSizeBytes,HealthCheckType,App_State,Stack_Name,Services,Routes,Developers,Detected_Start_Command"
 
 # ----------------------------------------------------------------------------
 # Prefetch buildpack metadata
@@ -342,21 +361,7 @@ process_app() {
     # List developers on the space
     dev_usernames=$(cf curl "${space_url}/developers" | jq -r '.resources // [] | .[] | .entity | select(.username != null) | .username' | paste -sd ':' -)
 
-    # Collect events for this app using the events_url from the app entity.  Use the
-    # pagination helper to fetch all pages of events.  Each event is output as a
-    # compact JSON string and events are joined with :#: to produce a single
-    # field.  If there are no events, the field will be empty.
-    events=""
-    events_url=$(echo "$app" | jq -r '.entity.events_url // empty')
-    if [[ -n "$events_url" ]]; then
-        events_json=$(fetch_all_pages_v2 "$events_url")
-        echo $events_json
-        # Join compact event JSON objects separated by :#:
-        events=$(echo "$events_json" | jq -cr '.resources[]?' | paste -sd ':#:' -)
-        events=${events:-""}
-    fi
-
-    echo "$org_name,$space_name,$created_at,$updated_at,$name,$app_guid,$instances,$memory,$disk_quota,$buildpack,$detected_buildpack,$detected_buildpack_guid,$buildpack_filename,$buildpack_version,$runtime_version,$droplet_size_bytes,$packages_size_bytes,$health_check,$app_state,$stack_name,$services,$routes,$dev_usernames,$detected_start_command,$events"
+    echo "$org_name,$space_name,$created_at,$updated_at,$name,$app_guid,$instances,$memory,$disk_quota,$buildpack,$detected_buildpack,$detected_buildpack_guid,$buildpack_filename,$buildpack_version,$runtime_version,$droplet_size_bytes,$packages_size_bytes,$health_check,$app_state,$stack_name,$services,$routes,$dev_usernames,$detected_start_command"
 
 }
 
