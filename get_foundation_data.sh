@@ -93,7 +93,7 @@ get_version_info() {
       if [[ -n "$jbp_config" && "$jbp_config" != "null" ]]; then
         runtime_version=$(grep -oE 'version:[[:space:]]*["'\'']?[^"'\'' ,}]+' <<<"$jbp_config" | head -1 | sed -E 's/^version:[[:space:]]*["'\'']?//')
       fi
-    end
+    fi
   elif [[ "$detected_buildpack" == *"node"* || "$detected_buildpack" == *"Node"* ]]; then
     runtime_version=$(jq -r '.environment_json.NODE_VERSION // empty' <<<"$env_data")
   elif [[ "$detected_buildpack" == *"python"* || "$detected_buildpack" == *"Python"* ]]; then
@@ -186,7 +186,6 @@ process_app() {
 
   local summary_json routes
   summary_json=$(cf curl "/v2/apps/${app_guid}/summary" 2>/dev/null || echo '{}')
-  # Use concatenation; avoids jq string interpolation
   routes=$(jq -r '.routes // [] | .[] | (.host + "." + .domain.name)' <<<"$summary_json" | paste -sd ':' -)
 
   # Per-app caches (guard against empty GUIDs)
@@ -254,5 +253,5 @@ for i in $(seq 1 "$total_pages"); do
     | while IFS= read -r app; do
         printf '%s\0' "$app"
       done \
-    | xargs -0 -P "$workers" -n 1 -I % bash -c 'process_app "$1"' _ %
+    | xargs -0 -P "$workers" -n 1  bash -c 'process_app "$1"' _
 done
