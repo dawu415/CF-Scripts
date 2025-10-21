@@ -230,11 +230,7 @@ echo "__NOEXEC__"
 
 
 function Invoke-SSH {
-  <#
-    Runs a remote command through ssh. We base64 the payload to dodge quoting.
-    Returns: [pscustomobject] @{ ExitCode; StdOut; StdErr }
-    Added: HardTimeoutSec → kill ssh if it exceeds N seconds (prevents watch from “hanging”)
-  #>
+  [CmdletBinding()]
   param(
     [Parameter(Mandatory)]$EnvCfg,
     [Parameter(Mandatory)][string]$RemoteCommand,
@@ -244,12 +240,15 @@ function Invoke-SSH {
   $base = Get-SshBaseArgs -EnvCfg $EnvCfg
   $payload    = ($RemoteCommand -replace "`r`n", "`n")
   $encodedcmd = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($payload))
-  #$remote     = "bash --noprofile --norc -lc 'base64 -d <<< $encodedcmd | bash -s'"
-  # Print a unique marker to BOTH stdout and stderr before running the payload.
-  # Anything printed by the server before our marker (legal banners, MOTD, etc.)
-  # will be sliced away in the post-processing step below.
-  # SAFE: no inner single quotes; prints a marker to stdout and stderr, then executes the payload
-  $remote = "bash --noprofile --norc -lc 'printf %s\n __CFORCH__; >&2 printf %s\n __CFORCH__; base64 -d <<< $encodedcmd | env -u BASH_ENV PATH=/usr/bin:/bin bash --noprofile --norc -s'"
+
+  # Use distinct markers for each stream to avoid any cross-stream ambiguity
+  $markerOut = "__CFORCH_OUT__"
+  $markerErr = "__CFORCH_ERR__"
+
+  # Print a marker to STDOUT and a different one to STDERR, then run the payload.
+  # Quote printf's format so \n is handled by printf, not the shell.
+  $remote = "bash --noprofile --norc -lc 'printf `"%s\n`" $markerOut; printf `"%s\n`" $markerErr 1>&2; " +
+            "base64 -d <<< $encodedcmd | env -u BASH_ENV PATH=/usr/bin:/bin bash --noprofile --norc -s'"
 
   if ($script:TraceSSH) {
     $bytes = [Text.Encoding]::UTF8.GetByteCount($payload)
@@ -280,19 +279,20 @@ function Invoke-SSH {
   $out = $proc.StandardOutput.ReadToEnd()
   $err = $proc.StandardError.ReadToEnd()
   $proc.WaitForExit()
-  # --- strip server banners: take content after our marker ---
-  $marker = "__CFORCH__"
+
+  # --- strip server banners: take content after our per-stream markers ---
   function Slice-AfterMarker([string]$txt, [string]$m) {
     if ([string]::IsNullOrEmpty($txt)) { return $txt }
     $idx = $txt.LastIndexOf($m)
     if ($idx -lt 0) { return $txt.Trim() }
     $start = $idx + $m.Length
-    # skip all immediate CR/LF characters right after the marker
-    while ($start -lt $txt.Length -and (([int][char]$txt[$start]) -in 10,13)) { $start++ }
+    # skip CR/LF/TAB/SPACE right after the marker
+    while ($start -lt $txt.Length -and (([int][char]$txt[$start]) -in 9,10,13,32)) { $start++ }
     return $txt.Substring($start).Trim()
   }
-  $out = Slice-AfterMarker $out $marker
-  $err = Slice-AfterMarker $err $marker
+
+  $out = Slice-AfterMarker $out $markerOut
+  $err = Slice-AfterMarker $err $markerErr
 
   return [pscustomobject]@{ ExitCode=$proc.ExitCode; StdOut=$out; StdErr=$err }
 }
