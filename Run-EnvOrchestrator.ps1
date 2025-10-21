@@ -92,6 +92,68 @@ function Get-SshBaseArgs {
   return $envargs
 }
 
+function Get-RemoteRunDir {
+  <#
+    Select an exec-capable writable base directory on the remote and
+    return "<base>/_run_<RunTag>". Honors an optional per-env override
+    property: $EnvCfg.RemoteBase (if present).
+  #>
+  param(
+    [Parameter(Mandatory)] $EnvCfg,
+    [Parameter(Mandatory)] [string] $RunTag
+  )
+
+  $pref = ""
+  if ($EnvCfg.PSObject.Properties.Name -contains 'RemoteBase' -and $EnvCfg.RemoteBase) {
+    $pref = $EnvCfg.RemoteBase
+  }
+
+  $probe = @'
+RUN_TAG="__TAG__"
+PREF="__PREF__"
+set -Eeuo pipefail
+
+# Build candidate list (optional preferred path first)
+candidates=()
+if [ -n "$PREF" ]; then candidates+=("$PREF"); fi
+candidates+=("$HOME/.cf_orch" "/var/tmp" "/dev/shm" "/tmp")
+
+# If this run tag already exists under any candidate, prefer that
+for base in "${candidates[@]}"; do
+  if [ -d "$base/_run_$RUN_TAG" ]; then
+    echo "$base"
+    exit 0
+  fi
+done
+
+# Otherwise find the first exec-capable, writable base
+TRUEBIN="$(command -v true 2>/dev/null || echo /bin/true)"
+for base in "${candidates[@]}"; do
+  mkdir -p "$base" >/dev/null 2>&1 || continue
+  [ -w "$base" ] || continue
+  t="$base/.exec_test_$$"
+  cp "$TRUEBIN" "$t" >/dev/null 2>&1 || continue
+  chmod +x "$t" >/dev/null 2>&1 || { rm -f "$t"; continue; }
+  "$t" >/dev/null 2>&1 && { rm -f "$t"; echo "$base"; exit 0; }
+  rm -f "$t" >/dev/null 2>&1 || true
+done
+
+echo "__NOEXEC__"
+'@
+
+  $probe = $probe.Replace('__TAG__', $RunTag).Replace('__PREF__', $pref)
+  $res   = Invoke-SSH -EnvCfg $EnvCfg -RemoteCommand $probe
+  if ($res.ExitCode -ne 0) {
+    throw "Failed to probe remote base dir on $($EnvCfg.Name): $($res.StdErr)"
+  }
+  # Use the last non-empty line from stdout (defensive against banners)
+  $base = ($res.StdOut -split "`r?`n" | Where-Object { $_ -and $_.Trim() } | Select-Object -Last 1).Trim()
+  if ([string]::IsNullOrWhiteSpace($base) -or $base -eq '__NOEXEC__') {
+    throw "No exec-capable writable directory found on $($EnvCfg.Name). Set EnvCfg.RemoteBase to a path (e.g. /home/<user>/.cf_orch) or ask ops to allow an exec-capable scratch dir."
+  }
+  return ([IO.Path]::Combine($base, "_run_$RunTag") -replace '\\','/')
+}
+
 function Invoke-SSH {
   <#
     Runs a remote command through ssh. We base64 the payload to dodge quoting.
@@ -381,7 +443,7 @@ if (-not $Resume) {
     Write-Host "=== LAUNCH BATCH: $($batch.Name -join ', ') ===" -ForegroundColor Cyan
 
     foreach ($envCfg in $batch) {
-      $remoteRunDir = "/tmp/_run_$RunTag"
+      $remoteRunDir = Get-RemoteRunDir -EnvCfg $envCfg -RunTag $RunTag
       $remoteRunDirByEnv[$envCfg.Name] = $remoteRunDir
 
       Ensure-Remote-Basics -EnvCfg $envCfg -RemoteRunDir $remoteRunDir
@@ -447,8 +509,9 @@ if (-not $Resume) {
 else {
   # RESUME: do not upload/launch; just register all env/platforms for polling
   foreach ($envCfg in $Environments) {
-    $remoteRunDir = "/tmp/_run_$RunTag"
+    $remoteRunDir = Get-RemoteRunDir -EnvCfg $envCfg -RunTag $RunTag
     $remoteRunDirByEnv[$envCfg.Name] = $remoteRunDir
+
     foreach ($p in $envCfg.Platforms) {
       $pending += [pscustomobject]@{
         EnvCfg       = $envCfg
@@ -513,11 +576,15 @@ while ($true) {
 # CLEANUP (only when not disabled; and only if remote dir still exists)
 if (-not $NoRemoteCleanup -and -not $Resume) {
   foreach ($envCfg in $Environments) {
-    $rrd = "/tmp/_run_$RunTag"
+    $rrd = $remoteRunDirByEnv[$envCfg.Name]
+    if (-not $rrd) {
+        # On resume-only runs, we may not have launched this session; resolve again
+        $rrd = Get-RemoteRunDir -EnvCfg $envCfg -RunTag $RunTag
+    }
     $check = Invoke-SSH -EnvCfg $envCfg -RemoteCommand "test -d '$rrd' && echo OK || echo MISS"
     if ($check.StdOut.Trim() -eq 'OK') {
-      [void](Invoke-SSH -EnvCfg $envCfg -RemoteCommand "rm -rf '$rrd'")
-      Write-Host "Cleaned $($envCfg.Name): $rrd" -ForegroundColor DarkGray
+        [void](Invoke-SSH -EnvCfg $envCfg -RemoteCommand "rm -rf '$rrd'")
+        Write-Host "Cleaned $($envCfg.Name): $rrd" -ForegroundColor DarkGray
     }
   }
 } else {
