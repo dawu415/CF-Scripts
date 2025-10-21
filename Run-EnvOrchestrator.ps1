@@ -213,9 +213,10 @@ echo "__NOEXEC__"
     throw "Failed to probe remote base dir on $($EnvCfg.Name): $($res.StdErr)"
   }
 
-  $raw = ($res.StdOut -replace '\r\n', "`n")  # normalize CRLF to LF
-  $base = ($raw -split "\r?\n" | Where-Object { $_ -and $_.Trim() } | Select-Object -Last 1)
-  $base = if ($base) { $base.Trim() } else { "" }
+  $raw   = ($res.StdOut -replace '\r\n', "`n")        # normalize
+  $lines = $raw -split "\n"
+  $nz    = $lines | Where-Object { $_ -and $_.Trim() }
+  $base  = if ($nz) { ($nz | Select-Object -Last 1).Trim() } else { "" }
 
   if ([string]::IsNullOrWhiteSpace($base) -or $base -eq '__NOEXEC__') {
     $dbgTrail = ($lines | Where-Object { $_ -like 'DBG:*' }) -join [environment]::NewLine
@@ -614,18 +615,24 @@ function Ensure-Remote-Basics {
 
   # 3) Normalize names & permissions on remote and show a quick verify when tracing
   $infLeafLocal = [IO.Path]::GetFileName($LocalFiles.InfScript)
-  $fix = @"
+
+  # Escape single quotes for safe embedding in bash single quotes
+  function _Esc([string]$s) { $s -replace "'", "'\''" }
+  $rrdEsc  = _Esc $RemoteRunDir
+  $leafEsc = _Esc $infLeafLocal
+
+  $fix = @'
 set -Eeuo pipefail
-cd '$RemoteRunDir'
+cd '<<RRD>>'
 
 # If the script isn't named exactly inf.sh, rename it so the launcher can ./inf.sh
 if [ ! -f inf.sh ]; then
-  if [ -f '$infLeafLocal' ]; then
-    mv -f '$infLeafLocal' inf.sh
+  if [ -f '<<INF_LEAF>>' ]; then
+    mv -f '<<INF_LEAF>>' inf.sh
   else
     # as a fallback: if exactly one *.sh exists, make it inf.sh
-    cnt=\$(ls -1 *.sh 2>/dev/null | wc -l | tr -d ' ')
-    if [ "\$cnt" = "1" ]; then mv -f \$(ls -1 *.sh) inf.sh; fi
+    cnt=$(ls -1 *.sh 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$cnt" = "1" ]; then mv -f $(ls -1 *.sh) inf.sh; fi
   fi
 fi
 
@@ -638,7 +645,9 @@ chmod +x inf.sh 2>/dev/null || true
 
 # Show what we have (helps when -TraceSSH is on)
 ls -l inf.sh cf 2>/dev/null || true
-"@
+'@
+
+  $fix = $fix.Replace('<<RRD>>', $rrdEsc).Replace('<<INF_LEAF>>', $leafEsc)
 
   $post = Invoke-SSH -EnvCfg $EnvCfg -RemoteCommand $fix -HardTimeoutSec $SshHardTimeoutSec
   if ($script:TraceSSH) {
