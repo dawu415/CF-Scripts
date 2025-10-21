@@ -17,10 +17,17 @@ param(
   # WATCH PHASE
   [int]$PollIntervalSec = 15,          # delay between poll rounds
   [int]$TimeoutSec = 4*60*60,          # overall watch timeout
+  [int]$StatusEvery = 1,               # print status-table every N rounds (1 = every round)
+  [switch]$WatchClear,                 # clear screen before each table (classic "watch" style)
+
+  # Debug/Tracing
+  [switch]$DebugLaunch,                # save sanitized remote launch script to OutRoot\debug
+  [switch]$ShowLaunchScript,           # also print sanitized launch script to console
+  [switch]$TraceSSH,                   # trace ssh calls (no secrets)
 
   # Misc
   [switch]$Resume,                     # do not upload/launch; only poll/download/cleanup
-  [switch]$NoRemoteCleanup             # preserve /tmp/_run_<RunTag> per env
+  [switch]$NoRemoteCleanup             # preserve remote run dir per env
 )
 
 # -------------------------
@@ -31,6 +38,9 @@ if (-not (Test-Path -LiteralPath $ConfigPath)) {
   throw "Configuration file not found: $ConfigPath"
 }
 . $ConfigPath
+
+# expose Trace flag to helpers
+$script:TraceSSH = $TraceSSH
 
 # -------------------------
 # Utilities
@@ -68,6 +78,28 @@ function New-UnixTextCopy {
   $utf8NoBom = New-Object Text.UTF8Encoding($false)
   [IO.File]::WriteAllText($tmp, $text, $utf8NoBom)
   return $tmp
+}
+
+function Redact-Secrets {
+  <#
+    Redact likely secrets in shell fragments (env exports, args).
+    We mask values for names containing PASSWORD|SECRET|TOKEN|KEY
+  #>
+  param([Parameter(Mandatory)][string]$Text)
+  $out = New-Object System.Text.StringBuilder
+  foreach ($line in ($Text -split "`r?`n")) {
+    if ($line -match '^\s*export\s+([A-Z0-9_]+)=(.+)$') {
+      $name = $matches[1]
+      if ($name -match 'PASSWORD|SECRET|TOKEN|KEY') {
+        $line = $line -replace '=(?:''.*?''|".*?"|\S+)', "='***REDACTED***'"
+      }
+    }
+    # also scrub: -p "<pwd>" or CF_PASSWORD=<val>
+    $line = [Regex]::Replace($line, '(?i)(\bCF_PASSWORD=)(\S+)', '$1***REDACTED***')
+    $line = [Regex]::Replace($line, '(?i)(-p\s+)(["'']?).+?\2', '$1***REDACTED***')
+    [void]$out.AppendLine($line)
+  }
+  $out.ToString()
 }
 
 function Get-SshBaseArgs {
@@ -116,7 +148,7 @@ set -Eeuo pipefail
 # Build candidate list (optional preferred path first)
 candidates=()
 if [ -n "$PREF" ]; then candidates+=("$PREF"); fi
-candidates+=("/tmp" "$HOME/.cf_orch" "/var/tmp")
+candidates+=("/tmp" "$HOME/.cf_orch")
 
 # If this run tag already exists under any candidate, prefer that
 for base in "${candidates[@]}"; do
@@ -146,7 +178,6 @@ echo "__NOEXEC__"
   if ($res.ExitCode -ne 0) {
     throw "Failed to probe remote base dir on $($EnvCfg.Name): $($res.StdErr)"
   }
-  # Use the last non-empty line from stdout (defensive against banners)
   $base = ($res.StdOut -split "`r?`n" | Where-Object { $_ -and $_.Trim() } | Select-Object -Last 1).Trim()
   if ([string]::IsNullOrWhiteSpace($base) -or $base -eq '__NOEXEC__') {
     throw "No exec-capable writable directory found on $($EnvCfg.Name). Set EnvCfg.RemoteBase to a path (e.g. /home/<user>/.cf_orch) or ask ops to allow an exec-capable scratch dir."
@@ -168,6 +199,11 @@ function Invoke-SSH {
   $payload    = ($RemoteCommand -replace "`r`n", "`n")
   $encodedcmd = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($payload))
   $remote     = "bash --noprofile --norc -lc 'base64 -d <<< $encodedcmd | bash -s'"
+
+  if ($script:TraceSSH) {
+    $bytes = [Text.Encoding]::UTF8.GetByteCount($payload)
+    Write-Host ("[TRACE] ssh {0}@{1}:{2} payload={3} bytes" -f $EnvCfg.User, $EnvCfg.Host, $EnvCfg.Port, $bytes) -ForegroundColor DarkGray
+  }
 
   $psi = New-Object System.Diagnostics.ProcessStartInfo
   $psi.FileName = "ssh"
@@ -358,8 +394,10 @@ echo __PENDING__
   return '__PENDING__'
 }
 
-
 function Check-PlatformStatus {
+  <#
+    Returns one of: Pending, Running, Finished, Missing (+ ExitCode if finished)
+  #>
   param($EnvCfg, [string]$RemoteRunDir, [string]$PlatformName)
 
 $statusTemplate = @'
@@ -373,7 +411,7 @@ if [ -f '<<RD>>/outputs/<<PL>>/pid' ]; then
   pid=$(cat '<<RD>>/outputs/<<PL>>/pid' 2>/dev/null)
   if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo STATE=Running; exit; fi
 fi
-echo STATE=Running
+echo STATE=Pending
 '@
 
   $cmd = $statusTemplate.Replace('<<RD>>', $RemoteRunDir).Replace('<<PL>>', $PlatformName)
@@ -381,15 +419,48 @@ echo STATE=Running
   $stdout = $res.StdOut.Trim()
   if ($stdout -match 'STATE=Missing') { return [pscustomobject]@{ State='Missing';  ExitCode=$null } }
   if ($stdout -match 'STATE=Finished EC=(\d+)') { return [pscustomobject]@{ State='Finished'; ExitCode=[int]$Matches[1] } }
-  return [pscustomobject]@{ State='Running'; ExitCode=$null }
+  if ($stdout -match 'STATE=Running') { return [pscustomobject]@{ State='Running'; ExitCode=$null } }
+  return [pscustomobject]@{ State='Pending'; ExitCode=$null }
 }
-
 
 function Download-PlatformOutputs {
   param($EnvCfg, [string]$RemoteRunDir, [string]$PlatformName, [string]$LocalRoot)
   $localOut = [IO.Path]::Combine($LocalRoot, $PlatformName)
   New-LocalDir $localOut
   Invoke-SCPDownload -EnvCfg $EnvCfg -RemotePathGlob "$RemoteRunDir/outputs/$PlatformName/*" -LocalDir $localOut
+}
+
+function Show-StatusTable {
+  param(
+    [Parameter(Mandatory)] $Tasks,
+    [Parameter(Mandatory)] [int] $Round,
+    [Parameter(Mandatory)] [datetime] $Start,
+    [switch]$Clear
+  )
+  if ($Clear) { Clear-Host }
+  $now = Get-Date
+  $elapsed = New-TimeSpan -Start $Start -End $now
+  Write-Host ("[{0}] RunTag={1} | Poll round #{2} | elapsed {3:hh\:mm\:ss}" -f $now.ToString('HH:mm:ss'), $RunTag, $Round, $elapsed) -ForegroundColor Cyan
+
+  $rows = foreach ($t in $Tasks) {
+    $disp = switch ($t.State) {
+      'Finished' { "_COMPLETED_ (ec=$($t.ExitCode))" }
+      'Running'  { '__RUNNING__' }
+      'Pending'  { '__PENDING__' }
+      'Missing'  { 'MISSING' }
+      default    { $t.State }
+    }
+    $since = if ($t.PSObject.Properties.Name -contains 'LastStateChange' -and $t.LastStateChange) {
+      (New-TimeSpan -Start $t.LastStateChange -End $now).ToString("hh\:mm\:ss")
+    } else { "" }
+    [pscustomobject]@{
+      Env       = $t.EnvName
+      Platform  = $t.PlatformName
+      Status    = $disp
+      LastChange= $since
+    }
+  }
+  $rows | Sort-Object Env, Platform | Format-Table -AutoSize | Out-String | Write-Host
 }
 
 # -------------------------
@@ -401,7 +472,7 @@ Assert-FileExists $LocalFiles.CfBinary   "LocalFiles.CfBinary"
 Assert-FileExists $LocalFiles.InfScript  "LocalFiles.InfScript"
 New-LocalDir $OutRoot
 
-$remoteRunDirByEnv = @{}     # envName -> /tmp/_run_<RunTag>
+$remoteRunDirByEnv = @{}     # envName -> resolved run dir
 $pending = @()               # list of task records we’ll poll
 $overallStart = Get-Date
 
@@ -420,11 +491,9 @@ $work = foreach ($envCfg in $Environments) {
 # Helper to prepare remote dir + uploads (idempotent)
 function Ensure-Remote-Basics {
   param($EnvCfg, [string]$RemoteRunDir)
-  # Create run dir
   $mk = Invoke-SSH -EnvCfg $EnvCfg -RemoteCommand "mkdir -p '$RemoteRunDir' && ls -ld '$RemoteRunDir'"
   if ($mk.ExitCode -ne 0) { throw "Failed to prepare remote dir for $($EnvCfg.Name): $($mk.StdErr)" }
 
-  # Upload cf + inf.sh (only if missing)
   $need = Invoke-SSH -EnvCfg $EnvCfg -RemoteCommand @"
 test -x '$RemoteRunDir/cf' && test -f '$RemoteRunDir/inf.sh' && echo OK || echo NEED
 "@
@@ -436,7 +505,6 @@ test -x '$RemoteRunDir/cf' && test -f '$RemoteRunDir/inf.sh' && echo OK || echo 
 
 # LAUNCH PHASE (unless -Resume)
 if (-not $Resume) {
-  # walk envs in batches
   for ($i = 0; $i -lt $Environments.Count; $i += $BatchSize) {
     $batch = $Environments[$i..([Math]::Min($i+$BatchSize-1, $Environments.Count-1))]
     Write-Host ""
@@ -452,7 +520,6 @@ if (-not $Resume) {
         $platformName = $p.Name
         $api          = $p.Api
 
-        # per-platform env exports + optional env file upload/source
         $envBlock = Build-EnvBlock -PlatformName $platformName
 
         $sourceCmd = ""
@@ -462,28 +529,38 @@ if (-not $Resume) {
           Invoke-SCPUpload -EnvCfg $envCfg -LocalPaths @($envFileSanitized) -RemoteDir $remoteRunDir
           $remoteLeaf       = [IO.Path]::GetFileName($envFileLocal)
           $uploadedLeaf     = [IO.Path]::GetFileName($envFileSanitized)
-          # move temp → final name
           [void](Invoke-SSH -EnvCfg $envCfg -RemoteCommand "mv -f '$remoteRunDir/$uploadedLeaf' '$remoteRunDir/$remoteLeaf' || true")
           $sourceCmd = "source '$remoteRunDir/$remoteLeaf'"
         }
 
-        # optional custom commands
         [string[]]$commandsToRun = $null
         if ($PlatformCommands -and $PlatformCommands.ContainsKey($platformName)) {
           $val = $PlatformCommands[$platformName]
           if ($val -is [string]) { $commandsToRun = @($val) } else { $commandsToRun = $val }
         }
 
-        # launch detached
         $script = Get-RemoteScriptDetached -RemoteRunDir $remoteRunDir -PlatformName $platformName -Api $api -EnvBlock $envBlock -SourceCmd $sourceCmd -Commands $commandsToRun
-        Write-Host $script
+
+        if ($DebugLaunch -or $ShowLaunchScript) {
+          $safe = Redact-Secrets $script
+          $dbgPath = [IO.Path]::Combine($OutRoot, "debug", $envCfg.Name, "$($platformName)-launch.sh")
+          New-LocalDir ([IO.Path]::GetDirectoryName($dbgPath))
+          [IO.File]::WriteAllText($dbgPath, $safe)
+          if ($ShowLaunchScript) {
+            Write-Host "----- BEGIN remote launch script ($($envCfg.Name)/$platformName) -----" -ForegroundColor Yellow
+            Write-Host $safe
+            Write-Host "----- END remote launch script -----" -ForegroundColor Yellow
+          } else {
+            Write-Host "Saved debug launch script → $dbgPath" -ForegroundColor DarkGray
+          }
+        }
+
         $launch = Invoke-SSH -EnvCfg $envCfg -RemoteCommand $script
         if ($launch.ExitCode -ne 0) {
           Write-Warning "Launch failed on $($envCfg.Name)/${platformName}: $($launch.StdErr)"
           continue
         }
 
-        # quick probe
         $qp = QuickProbe-Platform -EnvCfg $envCfg -RemoteRunDir $remoteRunDir -PlatformName $platformName -Checks $QuickChecks -DelaySec $QuickDelaySec
         if ($qp -in '__RUNNING__','0','__PENDING__') {
           Write-Host ("  -> {0}/{1} launched: {2}" -f $envCfg.Name,$platformName,$qp) -ForegroundColor DarkGray
@@ -491,36 +568,36 @@ if (-not $Resume) {
           Write-Warning ("  -> {0}/{1} early status: {2}" -f $envCfg.Name,$platformName,$qp)
         }
 
-        # register for watch phase
         $pending += [pscustomobject]@{
-          EnvCfg       = $envCfg
-          EnvName      = $envCfg.Name
-          RemoteRunDir = $remoteRunDir
-          PlatformName = $platformName
-          Api          = $api
-          Done         = $false
-          ExitCode     = $null
+          EnvCfg          = $envCfg
+          EnvName         = $envCfg.Name
+          RemoteRunDir    = $remoteRunDir
+          PlatformName    = $platformName
+          Api             = $api
+          Done            = $false
+          ExitCode        = $null
+          State           = 'Pending'
+          LastStateChange = Get-Date
         }
       }
     }
-    # move to next batch (no waiting here other than quick checks)
   }
 }
 else {
-  # RESUME: do not upload/launch; just register all env/platforms for polling
   foreach ($envCfg in $Environments) {
     $remoteRunDir = Get-RemoteRunDir -EnvCfg $envCfg -RunTag $RunTag
     $remoteRunDirByEnv[$envCfg.Name] = $remoteRunDir
-
     foreach ($p in $envCfg.Platforms) {
       $pending += [pscustomobject]@{
-        EnvCfg       = $envCfg
-        EnvName      = $envCfg.Name
-        RemoteRunDir = $remoteRunDir
-        PlatformName = $p.Name
-        Api          = $p.Api
-        Done         = $false
-        ExitCode     = $null
+        EnvCfg          = $envCfg
+        EnvName         = $envCfg.Name
+        RemoteRunDir    = $remoteRunDir
+        PlatformName    = $p.Name
+        Api             = $p.Api
+        Done            = $false
+        ExitCode        = $null
+        State           = 'Pending'
+        LastStateChange = Get-Date
       }
     }
   }
@@ -530,8 +607,10 @@ else {
 Write-Host ""
 Write-Host "=== WATCH/WAIT (RunTag=$RunTag) ===" -ForegroundColor Cyan
 $start = Get-Date
+$round = 0
 
 while ($true) {
+  $round++
   $remaining = $pending | Where-Object { -not $_.Done }
   if (-not $remaining) { break }
 
@@ -539,30 +618,36 @@ while ($true) {
     # If remote run dir missing (e.g., cleaned up outside), mark invalid and advise
     $dirCheck = Invoke-SSH -EnvCfg $task.EnvCfg -RemoteCommand "test -d '$($task.RemoteRunDir)' && echo OK || echo MISS"
     if ($dirCheck.StdOut.Trim() -eq 'MISS') {
-      Write-Warning ("[{0}] {1}/{2}: remote run dir missing for tag {3}. Treating as invalid. Check your local outputs." -f (Get-Date), $task.EnvName, $task.PlatformName, $RunTag)
+      if ($task.State -ne 'Missing') { $task.LastStateChange = Get-Date }
+      $task.State = 'Missing'
       $task.Done = $true
       $task.ExitCode = $null
       continue
     }
 
     $st = Check-PlatformStatus -EnvCfg $task.EnvCfg -RemoteRunDir $task.RemoteRunDir -PlatformName $task.PlatformName
+
+    # update state/last-change
+    if ($task.State -ne $st.State -or $task.ExitCode -ne $st.ExitCode) {
+      $task.LastStateChange = Get-Date
+    }
+    $task.State = $st.State
+    $task.ExitCode = $st.ExitCode
+
     switch ($st.State) {
       'Finished' {
         # download outputs then mark done
         $localRoot = [IO.Path]::Combine($OutRoot, [IO.Path]::Combine($task.EnvName, $task.PlatformName))
         Download-PlatformOutputs -EnvCfg $task.EnvCfg -RemoteRunDir $task.RemoteRunDir -PlatformName $task.PlatformName -LocalRoot $localRoot
         $task.Done = $true
-        $task.ExitCode = $st.ExitCode
         Write-Host ("[{0}] {1}/{2} -> exit {3}" -f (Get-Date).ToString('HH:mm:ss'), $task.EnvName, $task.PlatformName, $st.ExitCode)
       }
-      'Missing' {
-        Write-Warning ("[{0}] {1}/{2}: outputs folder missing; run may have been manually removed." -f (Get-Date).ToString('HH:mm:ss'), $task.EnvName, $task.PlatformName)
-        $task.Done = $true
-      }
-      default {
-        # Running: nothing to do
-      }
+      default { }
     }
+  }
+
+  if ($StatusEvery -gt 0 -and ($round % $StatusEvery -eq 0)) {
+    Show-StatusTable -Tasks $pending -Round $round -Start $start -Clear:$WatchClear
   }
 
   if ((Get-Date) - $start -gt [TimeSpan]::FromSeconds($TimeoutSec)) {
@@ -578,13 +663,12 @@ if (-not $NoRemoteCleanup -and -not $Resume) {
   foreach ($envCfg in $Environments) {
     $rrd = $remoteRunDirByEnv[$envCfg.Name]
     if (-not $rrd) {
-        # On resume-only runs, we may not have launched this session; resolve again
-        $rrd = Get-RemoteRunDir -EnvCfg $envCfg -RunTag $RunTag
+      $rrd = Get-RemoteRunDir -EnvCfg $envCfg -RunTag $RunTag
     }
     $check = Invoke-SSH -EnvCfg $envCfg -RemoteCommand "test -d '$rrd' && echo OK || echo MISS"
     if ($check.StdOut.Trim() -eq 'OK') {
-        [void](Invoke-SSH -EnvCfg $envCfg -RemoteCommand "rm -rf '$rrd'")
-        Write-Host "Cleaned $($envCfg.Name): $rrd" -ForegroundColor DarkGray
+      [void](Invoke-SSH -EnvCfg $envCfg -RemoteCommand "rm -rf '$rrd'")
+      Write-Host "Cleaned $($envCfg.Name): $rrd" -ForegroundColor DarkGray
     }
   }
 } else {
