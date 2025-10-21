@@ -602,6 +602,68 @@ $work = foreach ($envCfg in $Environments) {
   }
 }
 
+function Assert-RemoteArtifacts {
+  <#
+    Verifies that inf.sh exists, cf is executable, and ./cf actually runs.
+    Throws with rich diagnostics if anything is wrong.
+  #>
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)] $EnvCfg,
+    [Parameter(Mandatory)][string] $RemoteRunDir,
+    [int] $SshHardTimeoutSec = 0
+  )
+
+  # Bash-safe single-quote escape for embedding paths inside single-quoted strings
+  $rrdEsc = ($RemoteRunDir -replace "'", "'\''")
+
+  $verifyCmd = @"
+set -Eeuo pipefail
+cd '$rrdEsc' || exit 2
+
+# Ensure bits are set (idempotent)
+chmod +x cf 2>/dev/null || true
+chmod +x inf.sh 2>/dev/null || true
+
+# Structural checks
+[ -f inf.sh ] && [ -x cf ] || exit 3
+
+# Prove it's runnable (catches noexec/ACL/loader issues)
+"./cf" --version >/dev/null 2>&1 || exit 4
+exit 0
+"@
+
+  $verify = Invoke-SSH -EnvCfg $EnvCfg -RemoteCommand $verifyCmd -HardTimeoutSec $SshHardTimeoutSec
+  if ($verify.ExitCode -ne 0) {
+    # Deep diagnostics so the failure is actionable
+    $diagCmd = @"
+set +e
+cd '$rrdEsc' 2>/dev/null || true
+
+echo '--- id/uname ---'
+id; uname -a
+
+echo '--- mount options for run dir ---'
+( command -v findmnt >/dev/null 2>&1 && findmnt -no TARGET,OPTIONS --target . ) || ( mount | head -n 10 )
+
+echo '--- perms ---'
+ls -ld .; ls -l inf.sh cf 2>&1
+
+echo '--- stat ---'
+( stat -c '%n %a %A %U:%G %s %F' inf.sh cf 2>/dev/null || stat -f '%N %p %Sp %Su:%Sg %z %HT' inf.sh cf 2>/dev/null ) || true
+
+echo '--- ACL (if any) ---'
+( getfacl -p inf.sh cf 2>/dev/null ) || true
+
+echo '--- try ./cf --version ---'
+"./cf" --version ; echo "EC=$?"
+"@
+
+    $diag = Invoke-SSH -EnvCfg $EnvCfg -RemoteCommand $diagCmd -HardTimeoutSec $SshHardTimeoutSec
+    throw "Remote artifacts check failed on $($EnvCfg.Name) under $RemoteRunDir.`nVerifyExit=$($verify.ExitCode)`n$($diag.StdOut)`n$($diag.StdErr)"
+  }
+}
+
 # Helper to prepare remote dir + uploads (idempotent)
 function Ensure-Remote-Basics {
   param($EnvCfg, [string]$RemoteRunDir)
@@ -654,19 +716,7 @@ ls -l inf.sh cf 2>/dev/null || true
     Write-Host "[TRACE] post-upload verify ($($EnvCfg.Name)):`n$($post.StdOut)" -ForegroundColor DarkGray
   }
 
-  # Escape single quotes just like we did earlier, to be perfectly safe
-  function _Esc([string]$s) { $s -replace "'", "'\''" }
-  $rrdEsc = _Esc $RemoteRunDir
-
-  # 4) Hard verify and fail fast if missing (use exit code)
-  $verifyCmd = "[ -f '$rrdEsc/inf.sh' ] && [ -x '$rrdEsc/cf' ]"
-  $verify = Invoke-SSH -EnvCfg $EnvCfg -RemoteCommand $verifyCmd -HardTimeoutSec $SshHardTimeoutSec
-
-  if ($verify.ExitCode -ne 0) {
-    $ls = Invoke-SSH -EnvCfg $EnvCfg -RemoteCommand "ls -l '$rrdEsc/inf.sh' '$rrdEsc/cf' 2>&1 || true" -HardTimeoutSec $SshHardTimeoutSec
-    throw "Remote artifacts missing/invalid on $($EnvCfg.Name). Expected inf.sh and executable cf under $RemoteRunDir.`n$($ls.StdOut)`n$($ls.StdErr)"
-  }
-
+  Assert-RemoteArtifacts -EnvCfg $EnvCfg -RemoteRunDir $RemoteRunDir -SshHardTimeoutSec $SshHardTimeoutSec
 }
 
 
