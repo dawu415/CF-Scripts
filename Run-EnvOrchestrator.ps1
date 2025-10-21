@@ -9,6 +9,8 @@ param(
   [string]$RunTag = $(Get-Date -Format 'yyyyMMdd-HHmmss'),
   [string]$ConfigFile = "connect_env_config.ps1",
 
+  [int]$SshHardTimeoutSec = 120,        # kill any SSH call that runs longer than this
+
   # LAUNCH PHASE
   [int]$BatchSize = 3,                 # how many environments to process per batch
   [int]$QuickChecks = 2,               # how many quick PID/exit checks after launch
@@ -174,7 +176,7 @@ echo "__NOEXEC__"
 '@
 
   $probe = $probe.Replace('__TAG__', $RunTag).Replace('__PREF__', $pref)
-  $res   = Invoke-SSH -EnvCfg $EnvCfg -RemoteCommand $probe
+  $res   = Invoke-SSH -HardTimeoutSec $SshHardTimeoutSec -EnvCfg $EnvCfg -RemoteCommand $probe
   if ($res.ExitCode -ne 0) {
     throw "Failed to probe remote base dir on $($EnvCfg.Name): $($res.StdErr)"
   }
@@ -189,10 +191,12 @@ function Invoke-SSH {
   <#
     Runs a remote command through ssh. We base64 the payload to dodge quoting.
     Returns: [pscustomobject] @{ ExitCode; StdOut; StdErr }
+    Added: HardTimeoutSec → kill ssh if it exceeds N seconds (prevents watch from “hanging”)
   #>
   param(
     [Parameter(Mandatory)]$EnvCfg,
-    [Parameter(Mandatory)][string]$RemoteCommand
+    [Parameter(Mandatory)][string]$RemoteCommand,
+    [int]$HardTimeoutSec = 0
   )
 
   $base = Get-SshBaseArgs -EnvCfg $EnvCfg
@@ -215,10 +219,20 @@ function Invoke-SSH {
   $proc = New-Object System.Diagnostics.Process
   $proc.StartInfo = $psi
   [void]$proc.Start()
+
+  if ($HardTimeoutSec -gt 0) {
+    if (-not $proc.WaitForExit($HardTimeoutSec * 1000)) {
+      try { $proc.Kill() } catch { }
+      [void]$proc.WaitForExit(3000)
+      $out = $proc.StandardOutput.ReadToEnd()
+      $err = "[HARD TIMEOUT] exceeded ${HardTimeoutSec}s`n" + $proc.StandardError.ReadToEnd()
+      return [pscustomobject]@{ ExitCode = 255; StdOut = $out; StdErr = $err }
+    }
+  }
+
   $out = $proc.StandardOutput.ReadToEnd()
   $err = $proc.StandardError.ReadToEnd()
   $proc.WaitForExit()
-
   [pscustomobject]@{ ExitCode=$proc.ExitCode; StdOut=$out; StdErr=$err }
 }
 
@@ -386,7 +400,11 @@ echo __PENDING__
   $probeCmd = $probeTemplate.Replace('<<RD>>', $RemoteRunDir).Replace('<<PL>>', $PlatformName)
 
   for ($i=0; $i -lt $Checks; $i++) {
-    $probe = Invoke-SSH -EnvCfg $EnvCfg -RemoteCommand $probeCmd
+    $probe = Invoke-SSH -EnvCfg $EnvCfg -RemoteCommand $probeCmd -HardTimeoutSec $SshHardTimeoutSec
+    if ($probe.ExitCode -eq 255 -and $probe.StdErr -match 'HARD TIMEOUT') {
+      # Don’t block the batch on a slow host; treat as pending and move on
+      return '__PENDING__'
+    }
     $val = $probe.StdOut.Trim()
     if ($val -ne '__PENDING__') { return $val }
     Start-Sleep -Seconds $DelaySec
@@ -396,7 +414,7 @@ echo __PENDING__
 
 function Check-PlatformStatus {
   <#
-    Returns one of: Pending, Running, Finished, Missing (+ ExitCode if finished)
+    Returns one of: Pending, Running, Finished, Missing, Timeout (+ ExitCode if finished)
   #>
   param($EnvCfg, [string]$RemoteRunDir, [string]$PlatformName)
 
@@ -415,11 +433,16 @@ echo STATE=Pending
 '@
 
   $cmd = $statusTemplate.Replace('<<RD>>', $RemoteRunDir).Replace('<<PL>>', $PlatformName)
-  $res = Invoke-SSH -EnvCfg $EnvCfg -RemoteCommand $cmd
+  $res = Invoke-SSH -EnvCfg $EnvCfg -RemoteCommand $cmd -HardTimeoutSec $SshHardTimeoutSec
+
+  if ($res.ExitCode -eq 255 -and $res.StdErr -match 'HARD TIMEOUT') {
+    return [pscustomobject]@{ State='Timeout'; ExitCode=$null }
+  }
+
   $stdout = $res.StdOut.Trim()
-  if ($stdout -match 'STATE=Missing') { return [pscustomobject]@{ State='Missing';  ExitCode=$null } }
-  if ($stdout -match 'STATE=Finished EC=(\d+)') { return [pscustomobject]@{ State='Finished'; ExitCode=[int]$Matches[1] } }
-  if ($stdout -match 'STATE=Running') { return [pscustomobject]@{ State='Running'; ExitCode=$null } }
+  if ($stdout -match 'STATE=Missing')          { return [pscustomobject]@{ State='Missing';  ExitCode=$null } }
+  if ($stdout -match 'STATE=Finished EC=(\d+)'){ return [pscustomobject]@{ State='Finished'; ExitCode=[int]$Matches[1] } }
+  if ($stdout -match 'STATE=Running')          { return [pscustomobject]@{ State='Running';  ExitCode=$null } }
   return [pscustomobject]@{ State='Pending'; ExitCode=$null }
 }
 
@@ -442,12 +465,14 @@ function Show-StatusTable {
   $elapsed = New-TimeSpan -Start $Start -End $now
   Write-Host ("[{0}] RunTag={1} | Poll round #{2} | elapsed {3:hh\:mm\:ss}" -f $now.ToString('HH:mm:ss'), $RunTag, $Round, $elapsed) -ForegroundColor Cyan
 
+  # Build rows
   $rows = foreach ($t in $Tasks) {
     $disp = switch ($t.State) {
       'Finished' { "_COMPLETED_ (ec=$($t.ExitCode))" }
       'Running'  { '__RUNNING__' }
       'Pending'  { '__PENDING__' }
       'Missing'  { 'MISSING' }
+      'Timeout'  { 'SSH_TIMEOUT' }
       default    { $t.State }
     }
     $since = if ($t.PSObject.Properties.Name -contains 'LastStateChange' -and $t.LastStateChange) {
@@ -460,7 +485,28 @@ function Show-StatusTable {
       LastChange= $since
     }
   }
-  $rows | Sort-Object Env, Platform | Format-Table -AutoSize | Out-String | Write-Host
+
+  # Simple, immediate print (no AutoSize buffering)
+  $rows = $rows | Sort-Object Env, Platform
+
+  # Compute widths safely
+  $envLens  = @()
+  $platLens = @()
+  foreach ($r in $rows) { $envLens += $r.Env.Length; $platLens += $r.Platform.Length }
+  $maxEnv  = if ($envLens.Count)  { ($envLens  | Measure-Object -Maximum).Maximum } else { 3 }
+  $maxPlat = if ($platLens.Count) { ($platLens | Measure-Object -Maximum).Maximum } else { 8 }
+
+  $wEnv  = [Math]::Min(30, [Math]::Max(3, $maxEnv))
+  $wPlat = [Math]::Min(24, [Math]::Max(8, $maxPlat))
+  $wStat = 28
+  $fmt   = "{0,-$wEnv}  {1,-$wPlat}  {2,-$wStat}  {3,9}"
+
+  Write-Host ($fmt -f 'Env','Platform','Status','LastChange')
+  Write-Host ($fmt -f ('-'*$wEnv), ('-'*$wPlat), ('-'*$wStat), ('-'*9))
+  foreach ($r in $rows) {
+    Write-Host ($fmt -f $r.Env, $r.Platform, $r.Status, $r.LastChange)
+  }
+  Write-Host ""
 }
 
 # -------------------------
@@ -491,15 +537,15 @@ $work = foreach ($envCfg in $Environments) {
 # Helper to prepare remote dir + uploads (idempotent)
 function Ensure-Remote-Basics {
   param($EnvCfg, [string]$RemoteRunDir)
-  $mk = Invoke-SSH -EnvCfg $EnvCfg -RemoteCommand "mkdir -p '$RemoteRunDir' && ls -ld '$RemoteRunDir'"
+  $mk   = Invoke-SSH -EnvCfg $EnvCfg -RemoteCommand "mkdir -p '$RemoteRunDir' && ls -ld '$RemoteRunDir'" -HardTimeoutSec $SshHardTimeoutSec
   if ($mk.ExitCode -ne 0) { throw "Failed to prepare remote dir for $($EnvCfg.Name): $($mk.StdErr)" }
 
   $need = Invoke-SSH -EnvCfg $EnvCfg -RemoteCommand @"
 test -x '$RemoteRunDir/cf' && test -f '$RemoteRunDir/inf.sh' && echo OK || echo NEED
-"@
+"@ -HardTimeoutSec $SshHardTimeoutSec
   if ($need.StdOut.Trim() -eq 'NEED') {
     Invoke-SCPUpload -EnvCfg $EnvCfg -LocalPaths @($LocalFiles.CfBinary, $LocalFiles.InfScript) -RemoteDir $RemoteRunDir
-    [void](Invoke-SSH -EnvCfg $EnvCfg -RemoteCommand "chmod +x '$RemoteRunDir/cf' '$RemoteRunDir/inf.sh' || true")
+    [void](Invoke-SSH -EnvCfg $EnvCfg -RemoteCommand "chmod +x '$RemoteRunDir/cf' '$RemoteRunDir/inf.sh' || true" -HardTimeoutSec $SshHardTimeoutSec)
   }
 }
 
@@ -529,7 +575,7 @@ if (-not $Resume) {
           Invoke-SCPUpload -EnvCfg $envCfg -LocalPaths @($envFileSanitized) -RemoteDir $remoteRunDir
           $remoteLeaf       = [IO.Path]::GetFileName($envFileLocal)
           $uploadedLeaf     = [IO.Path]::GetFileName($envFileSanitized)
-          [void](Invoke-SSH -EnvCfg $envCfg -RemoteCommand "mv -f '$remoteRunDir/$uploadedLeaf' '$remoteRunDir/$remoteLeaf' || true")
+          [void](Invoke-SSH -EnvCfg $envCfg -RemoteCommand "mv -f '$remoteRunDir/$uploadedLeaf' '$remoteRunDir/$remoteLeaf' || true" -HardTimeoutSec $SshHardTimeoutSec)
           $sourceCmd = "source '$remoteRunDir/$remoteLeaf'"
         }
 
@@ -555,7 +601,7 @@ if (-not $Resume) {
           }
         }
 
-        $launch = Invoke-SSH -EnvCfg $envCfg -RemoteCommand $script
+        $launch = Invoke-SSH -EnvCfg $envCfg -RemoteCommand $script -HardTimeoutSec $SshHardTimeoutSec
         if ($launch.ExitCode -ne 0) {
           Write-Warning "Launch failed on $($envCfg.Name)/${platformName}: $($launch.StdErr)"
           continue
@@ -612,11 +658,28 @@ $round = 0
 while ($true) {
   $round++
   $remaining = $pending | Where-Object { -not $_.Done }
+
+  # print heartbeat at the start of the round
+  if ($StatusEvery -gt 0 -and (($round - 1) % $StatusEvery -eq 0)) {
+    Show-StatusTable -Tasks $pending -Round $round -Start $start -Clear:$WatchClear
+  }
+
   if (-not $remaining) { break }
 
   foreach ($task in $remaining) {
     # If remote run dir missing (e.g., cleaned up outside), mark invalid and advise
-    $dirCheck = Invoke-SSH -EnvCfg $task.EnvCfg -RemoteCommand "test -d '$($task.RemoteRunDir)' && echo OK || echo MISS"
+    $dirCheck = Invoke-SSH -EnvCfg $task.EnvCfg -RemoteCommand "test -d '$($task.RemoteRunDir)' && echo OK || echo MISS" -HardTimeoutSec $SshHardTimeoutSec
+    
+    if ($TraceSSH) {
+      Write-Host ("[TRACE] polling {0}/{1}" -f $task.EnvName, $task.PlatformName) -ForegroundColor DarkGray
+    }
+
+    if ($dirCheck.ExitCode -eq 255 -and $dirCheck.StdErr -match 'HARD TIMEOUT') {
+      if ($task.State -ne 'Timeout') { $task.LastStateChange = Get-Date }
+      $task.State = 'Timeout'
+      continue
+    }
+
     if ($dirCheck.StdOut.Trim() -eq 'MISS') {
       if ($task.State -ne 'Missing') { $task.LastStateChange = Get-Date }
       $task.State = 'Missing'
@@ -665,9 +728,9 @@ if (-not $NoRemoteCleanup -and -not $Resume) {
     if (-not $rrd) {
       $rrd = Get-RemoteRunDir -EnvCfg $envCfg -RunTag $RunTag
     }
-    $check = Invoke-SSH -EnvCfg $envCfg -RemoteCommand "test -d '$rrd' && echo OK || echo MISS"
+    $check = Invoke-SSH -EnvCfg $envCfg -RemoteCommand "test -d '$rrd' && echo OK || echo MISS" -HardTimeoutSec $SshHardTimeoutSec
     if ($check.StdOut.Trim() -eq 'OK') {
-      [void](Invoke-SSH -EnvCfg $envCfg -RemoteCommand "rm -rf '$rrd'")
+      [void](Invoke-SSH -EnvCfg $envCfg -RemoteCommand "rm -rf '$rrd'" -HardTimeoutSec $SshHardTimeoutSec)
       Write-Host "Cleaned $($envCfg.Name): $rrd" -ForegroundColor DarkGray
     }
   }
