@@ -108,7 +108,9 @@ function Get-SshBaseArgs {
   param($EnvCfg)
   $envargs = @(
     "-T",
+    "-q",                       # quiet client output
     "-p", $EnvCfg.Port.ToString(),
+    "-o","LogLevel=ERROR",      # suppress warnings/banners from the client
     "-o","BatchMode=yes",
     "-o","IdentitiesOnly=yes",
     "-o","ServerAliveInterval=60",
@@ -180,7 +182,7 @@ echo "__NOEXEC__"
   if ($res.ExitCode -ne 0) {
     throw "Failed to probe remote base dir on $($EnvCfg.Name): $($res.StdErr)"
   }
-  $base = ($res.StdOut -split "`r?`n" | Where-Object { $_ -and $_.Trim() } | Select-Object -Last 1).Trim()
+  $base = ($res.StdOut -split "\r?\n" | Where-Object { $_ -and $_.Trim() } | Select-Object -Last 1).Trim()
   if ([string]::IsNullOrWhiteSpace($base) -or $base -eq '__NOEXEC__') {
     throw "No exec-capable writable directory found on $($EnvCfg.Name). Set EnvCfg.RemoteBase to a path (e.g. /home/<user>/.cf_orch) or ask ops to allow an exec-capable scratch dir."
   }
@@ -202,7 +204,12 @@ function Invoke-SSH {
   $base = Get-SshBaseArgs -EnvCfg $EnvCfg
   $payload    = ($RemoteCommand -replace "`r`n", "`n")
   $encodedcmd = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($payload))
-  $remote     = "bash --noprofile --norc -lc 'base64 -d <<< $encodedcmd | bash -s'"
+  #$remote     = "bash --noprofile --norc -lc 'base64 -d <<< $encodedcmd | bash -s'"
+  # Print a unique marker to BOTH stdout and stderr before running the payload.
+  # Anything printed by the server before our marker (legal banners, MOTD, etc.)
+  # will be sliced away in the post-processing step below.
+  # SAFE: no inner single quotes; prints a marker to stdout and stderr, then executes the payload
+  $remote = "bash --noprofile --norc -lc 'printf %s\\n __CFORCH__; >&2 printf %s\\n __CFORCH__; base64 -d <<< $encodedcmd | bash -s'"
 
   if ($script:TraceSSH) {
     $bytes = [Text.Encoding]::UTF8.GetByteCount($payload)
@@ -233,7 +240,21 @@ function Invoke-SSH {
   $out = $proc.StandardOutput.ReadToEnd()
   $err = $proc.StandardError.ReadToEnd()
   $proc.WaitForExit()
-  [pscustomobject]@{ ExitCode=$proc.ExitCode; StdOut=$out; StdErr=$err }
+  # --- strip server banners: take content after our marker ---
+  $marker = "__CFORCH__"
+  function Slice-AfterMarker([string]$txt, [string]$m) {
+    if ([string]::IsNullOrEmpty($txt)) { return $txt }
+    $idx = $txt.LastIndexOf($m)
+    if ($idx -lt 0) { return $txt.Trim() }
+    $start = $idx + $m.Length
+    # skip one trailing newline after the marker if present
+    if ($start -lt $txt.Length -and ($txt[$start] -eq "`n" -or $txt[$start] -eq "`r")) { $start++ }
+    return $txt.Substring($start).Trim()
+  }
+  $out = Slice-AfterMarker $out $marker
+  $err = Slice-AfterMarker $err $marker
+
+  return [pscustomobject]@{ ExitCode=$proc.ExitCode; StdOut=$out; StdErr=$err }
 }
 
 function Invoke-SCPUpload {
@@ -260,13 +281,17 @@ function Invoke-SCPUpload {
       $prepared += $dest
     }
 
-    $opts = @("-T",
-              "-o","BatchMode=yes",
-              "-o","IdentitiesOnly=yes",
-              "-o","StrictHostKeyChecking=no",
-              "-o","UserKnownHostsFile=/dev/null",
-              "-o","Ciphers=aes128-ctr",
-              "-o","MACs=hmac-sha2-256")
+    $opts = @(
+    "-T",
+    "-q",                        # quiet scp: no progress meters/banners
+    "-o","BatchMode=yes",
+    "-o","IdentitiesOnly=yes",
+    "-o","StrictHostKeyChecking=no",
+    "-o","UserKnownHostsFile=/dev/null",
+    "-o","Ciphers=aes128-ctr",
+    "-o","MACs=hmac-sha2-256"
+    )
+
     $envargs = @()
     if ($EnvCfg.Auth.Type -eq 'key' -and $EnvCfg.Auth.KeyPath) { $envargs += @("-i", $EnvCfg.Auth.KeyPath) }
     $envargs += @("-P", $EnvCfg.Port.ToString()) + $prepared + "$($EnvCfg.User)@$($EnvCfg.Host):$RemoteDir/"
@@ -287,13 +312,16 @@ function Invoke-SCPDownload {
     [Parameter(Mandatory)][string]$LocalDir
   )
   New-LocalDir $LocalDir
-  $opts = @("-T",
-            "-o","BatchMode=yes",
-            "-o","IdentitiesOnly=yes",
-            "-o","StrictHostKeyChecking=no",
-            "-o","UserKnownHostsFile=/dev/null",
-            "-o","Ciphers=aes128-ctr",
-            "-o","MACs=hmac-sha2-256")
+  $opts = @(
+    "-T",
+    "-q",                        # quiet scp: no progress meters/banners
+    "-o","BatchMode=yes",
+    "-o","IdentitiesOnly=yes",
+    "-o","StrictHostKeyChecking=no",
+    "-o","UserKnownHostsFile=/dev/null",
+    "-o","Ciphers=aes128-ctr",
+    "-o","MACs=hmac-sha2-256"
+  )
   $envargs = @()
   if ($EnvCfg.Auth.Type -eq 'key' -and $EnvCfg.Auth.KeyPath) { $envargs += @("-i", $EnvCfg.Auth.KeyPath) }
   $envargs += @("-P", $EnvCfg.Port.ToString(), "$($EnvCfg.User)@$($EnvCfg.Host):$RemotePathGlob", $LocalDir)
