@@ -14,31 +14,57 @@ trap 'ec=$?; set +u;
       exit "${ec:-1}"' ERR
 
 # ----------------------------- helpers -----------------------------
-
+# --- v2 pagination: follow .next_url, merge resources (safe; uses jq -s) ---
 fetch_all_pages_v2() {
-  local base="$1" url acc resp next_url
-  if [[ "$base" == *"?"* ]]; then url="${base}&results-per-page=100"; else url="${base}?results-per-page=100"; fi
-  acc='{ "resources": [] }'
-  while [[ -n "$url" ]]; do
-    resp=$(cf curl "$url" 2>/dev/null || echo '{}')
-    acc=$(jq --argjson res "$resp" '.resources += ($res.resources // [])' <<<"$acc")
-    next_url=$(jq -r '.next_url // empty' <<<"$resp")
-    url="$next_url"
-  done
-  echo "$acc"
+    local base_path="$1"
+    local url="$base_path"
+    if [[ "$url" == *"?"* ]]; then
+        url="${url}&results-per-page=100"
+    else
+        url="${url}?results-per-page=100"
+    fi
+
+    local acc='{"resources":[]}'
+    local resp next_url
+    while [[ -n "$url" ]]; do
+        resp=$(cf curl "$url" 2>/dev/null || echo '{}')
+
+        # Optional: guard against non-JSON responses (proxies, banners, etc.)
+        if ! printf '%s' "$resp" | jq -e . >/dev/null 2>&1; then
+            resp='{"resources":[],"next_url":null}'
+        fi
+
+        # Slurp acc + resp → [accDoc, respDoc], then append page resources.
+        acc=$(printf '%s\n%s\n' "$acc" "$resp" \
+              | jq -cs '.[0].resources += (.[1].resources // []) | .[0]')
+
+        next_url=$(printf '%s' "$resp" | jq -r '.next_url // empty')
+        url="${next_url:-}"
+    done
+    printf '%s\n' "$acc"
 }
 
+# --- v3 pagination: follow .pagination.next.href, merge resources (safe; jq -s) ---
 fetch_all_pages_v3() {
-  local url="$1" acc resp next_url
-  acc='{ "resources": [] }'
-  while [[ -n "$url" ]]; do
-    resp=$(cf curl "$url" 2>/dev/null || echo '{}')
-    acc=$(jq --argjson res "$resp" '.resources += ($res.resources // [])' <<<"$acc")
-    next_url=$(jq -r '.pagination.next.href // empty' <<<"$resp")
-    url="$next_url"
-  done
-  echo "$acc"
+    local url="$1"  # caller includes ?per_page=... and any filters
+    local acc='{"resources":[]}'
+    local resp next_url
+    while [[ -n "$url" ]]; do
+        resp=$(cf curl "$url" 2>/dev/null || echo '{}')
+
+        if ! printf '%s' "$resp" | jq -e . >/dev/null 2>&1; then
+            resp='{"resources":[],"pagination":{"next":{"href":null}}}'
+        fi
+
+        acc=$(printf '%s\n%s\n' "$acc" "$resp" \
+              | jq -cs '.[0].resources += (.[1].resources // []) | .[0]')
+
+        next_url=$(printf '%s' "$resp" | jq -r '.pagination.next.href // empty')
+        url="${next_url:-}"
+    done
+    printf '%s\n' "$acc"
 }
+
 
 # Cache heavy catalogs to files so every worker can read them safely
 TMP_ROOT="${TMPDIR:-/tmp}"
@@ -244,14 +270,19 @@ process_app() {
 export -f process_app fetch_all_pages_v2 fetch_all_pages_v3 get_buildpack_filename get_version_info get_stack_name_safe get_space_org_names_safe
 
 # ---------------------------- driver ------------------------------
-total_pages=$(cf curl "/v2/apps?results-per-page=100" | jq '.total_pages // 1')
+# Pull the full apps catalog via robust v2 pagination to avoid relying on .total_pages
+APPS_JSON_FILE="$WORK_DIR/apps.json"
+fetch_all_pages_v2 "/v2/apps" >"$APPS_JSON_FILE"
+
+# If the response isn't JSON (e.g., not logged in, proxy banner), fail fast with a clear message
+if ! jq -e . >/dev/null 2>&1 <"$APPS_JSON_FILE"; then
+  echo "cf curl /v2/apps did not return valid JSON. Are you logged in? (cf login) Is the API reachable?" >&2
+  exit 5
+fi
+
 workers="${WORKERS:-6}"
 
-for i in $(seq 1 "$total_pages"); do
-  cf curl "/v2/apps?page=$i&results-per-page=100" \
-    | jq -c '.resources // [] | .[]' \
-    | while IFS= read -r app; do
-        printf '%s\0' "$app"
-      done \
-    | xargs -0 -P "$workers" -n 1  bash -c 'process_app "$1"' _
-done
+# Stream each app (compact JSON) to a worker; use NUL delimiters for safety
+jq -c '.resources // [] | .[]' "$APPS_JSON_FILE" \
+  | while IFS= read -r app; do printf '%s\0' "$app"; done \
+  | xargs -0 -P "$workers" -n 1 bash -c 'process_app "$1"' _

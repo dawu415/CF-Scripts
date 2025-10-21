@@ -26,7 +26,7 @@ param(
 # -------------------------
 # Load configuration
 # -------------------------
-$ConfigPath = Join-Path -LiteralPath $PSScriptRoot -ChildPath $ConfigFile
+$ConfigPath = [IO.Path]::Combine($PSScriptRoot,$ConfigFile)
 if (-not (Test-Path -LiteralPath $ConfigPath)) {
   throw "Configuration file not found: $ConfigPath"
 }
@@ -64,7 +64,7 @@ function New-UnixTextCopy {
   $text = [Text.Encoding]::UTF8.GetString($bytes)
   $text = $text -replace "`r`n", "`n" -replace "`r", "`n"
   if (-not $text.EndsWith("`n")) { $text += "`n" }
-  $tmp = Join-Path $env:TEMP ("unix_" + [guid]::NewGuid() + [IO.Path]::GetExtension($Path))
+  $tmp = [IO.Path]::Combine($env:TEMP, ("unix_" + [guid]::NewGuid() + [IO.Path]::GetExtension($Path)))
   $utf8NoBom = New-Object Text.UTF8Encoding($false)
   [IO.File]::WriteAllText($tmp, $text, $utf8NoBom)
   return $tmp
@@ -72,7 +72,7 @@ function New-UnixTextCopy {
 
 function Get-SshBaseArgs {
   param($EnvCfg)
-  $args = @(
+  $envargs = @(
     "-T",
     "-p", $EnvCfg.Port.ToString(),
     "-o","BatchMode=yes",
@@ -87,9 +87,9 @@ function Get-SshBaseArgs {
     "$($EnvCfg.User)@$($EnvCfg.Host)"
   )
   if ($EnvCfg.Auth.Type -eq 'key' -and $EnvCfg.Auth.KeyPath) {
-    $args = @("-i", $EnvCfg.Auth.KeyPath) + $args
+    $envargs = @("-i", $EnvCfg.Auth.KeyPath) + $envargs
   }
-  return $args
+  return $envargs
 }
 
 function Invoke-SSH {
@@ -130,7 +130,7 @@ function Invoke-SCPUpload {
     [Parameter(Mandatory)][string[]]$LocalPaths,
     [Parameter(Mandatory)][string]$RemoteDir
   )
-  $tempDir = Join-Path $env:TEMP ("push_" + [guid]::NewGuid())
+  $tempDir = [IO.Path]::Combine($env:TEMP, ("push_" + [guid]::NewGuid()))
   New-Item -ItemType Directory -Path $tempDir | Out-Null
   $prepared = @()
   try {
@@ -138,11 +138,11 @@ function Invoke-SCPUpload {
       Assert-FileExists $p
       $dest = $p
       if ($p -match '\\cf\.exe$') {
-        $dest = Join-Path $tempDir "cf"  # rename on Windows → cf (no .exe)
+        $dest = [IO.Path]::Combine($tempDir, "cf")  # rename on Windows → cf (no .exe)
         Copy-Item $p $dest -Force
       } elseif ($p -match '\.(sh|env|txt|cfg|conf|vars)$') {
         $san = New-UnixTextCopy $p
-        $dest = Join-Path $tempDir ([IO.Path]::GetFileName($p))
+        $dest = [IO.Path]::Combine($tempDir, ([IO.Path]::GetFileName($p)))
         Copy-Item $san $dest -Force
       }
       $prepared += $dest
@@ -155,12 +155,12 @@ function Invoke-SCPUpload {
               "-o","UserKnownHostsFile=/dev/null",
               "-o","Ciphers=aes128-ctr",
               "-o","MACs=hmac-sha2-256")
-    $args = @()
-    if ($EnvCfg.Auth.Type -eq 'key' -and $EnvCfg.Auth.KeyPath) { $args += @("-i", $EnvCfg.Auth.KeyPath) }
-    $args += @("-P", $EnvCfg.Port.ToString()) + $prepared + "$($EnvCfg.User)@$($EnvCfg.Host):$RemoteDir/"
+    $envargs = @()
+    if ($EnvCfg.Auth.Type -eq 'key' -and $EnvCfg.Auth.KeyPath) { $envargs += @("-i", $EnvCfg.Auth.KeyPath) }
+    $envargs += @("-P", $EnvCfg.Port.ToString()) + $prepared + "$($EnvCfg.User)@$($EnvCfg.Host):$RemoteDir/"
 
     Write-Host "scp -> $($EnvCfg.Name):$RemoteDir" -ForegroundColor DarkGray
-    & scp @opts -r @args | Out-Null
+    & scp @opts -r @envargs | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "SCP upload failed (code $LASTEXITCODE)" }
   }
   finally {
@@ -182,12 +182,12 @@ function Invoke-SCPDownload {
             "-o","UserKnownHostsFile=/dev/null",
             "-o","Ciphers=aes128-ctr",
             "-o","MACs=hmac-sha2-256")
-  $args = @()
-  if ($EnvCfg.Auth.Type -eq 'key' -and $EnvCfg.Auth.KeyPath) { $args += @("-i", $EnvCfg.Auth.KeyPath) }
-  $args += @("-P", $EnvCfg.Port.ToString(), "$($EnvCfg.User)@$($EnvCfg.Host):$RemotePathGlob", $LocalDir)
+  $envargs = @()
+  if ($EnvCfg.Auth.Type -eq 'key' -and $EnvCfg.Auth.KeyPath) { $envargs += @("-i", $EnvCfg.Auth.KeyPath) }
+  $envargs += @("-P", $EnvCfg.Port.ToString(), "$($EnvCfg.User)@$($EnvCfg.Host):$RemotePathGlob", $LocalDir)
 
   Write-Host "scp <- $RemotePathGlob" -ForegroundColor DarkGray
-  & scp -r @opts @args | Out-Null
+  & scp -r @opts @envargs | Out-Null
   if ($LASTEXITCODE -ne 0) { Write-Warning "SCP download returned code $LASTEXITCODE (may be 'no files')." }
 }
 
@@ -208,14 +208,6 @@ function Build-EnvBlock {
 }
 
 function Get-RemoteScriptDetached {
-  <#
-    Returns a bash script that:
-      - sets up dirs & CF_HOME
-      - optionally 'source' a per-platform env file
-      - logs to outputs/<platform>/run.out and run.err
-      - runs inf.sh (or custom commands) under nohup
-      - writes PID and exit.code
-  #>
   param(
     [string]$RemoteRunDir,
     [string]$PlatformName,
@@ -231,51 +223,65 @@ function Get-RemoteScriptDetached {
     "./inf.sh '$Api'"
   }
 
-@"
+$tmpl = @'
 set -Eeuo pipefail
-$EnvBlock
-$SourceCmd
+{{ENV_BLOCK}}
+{{SOURCE_CMD}}
 
-cd '$RemoteRunDir'
-mkdir -p outputs/$PlatformName
-export CF_HOME='$RemoteRunDir/.cf/$PlatformName'
+cd '{{REMOTE_DIR}}'
+mkdir -p outputs/{{PLATFORM}}
+export CF_HOME='{{REMOTE_DIR}}/.cf/{{PLATFORM}}'
 chmod +x inf.sh cf || true
-rm -f outputs/$PlatformName/pid outputs/$PlatformName/exit.code || true
+rm -f outputs/{{PLATFORM}}/pid outputs/{{PLATFORM}}/exit.code || true
 
-nohup bash --noprofile --norc >"outputs/$PlatformName/run.out" 2>"outputs/$PlatformName/run.err" <<'__RUN__' & echo $! > "outputs/$PlatformName/pid"
+# Use a quoted heredoc so the *outer* shell doesn't expand;
+# the inner bash will execute/expand it normally.
+nohup bash --noprofile --norc >"outputs/{{PLATFORM}}/run.out" 2>"outputs/{{PLATFORM}}/run.err" <<'__RUN__' & echo $! > "outputs/{{PLATFORM}}/pid"
 set -Eeuo pipefail
-trap 'ec=$?; ts=$(date "+%F %T");
-      echo "[$ts] ERROR ${ec:-1} at ${BASH_SOURCE[0]}:${LINENO}: ${FUNCNAME[0]:-main}: ${BASH_COMMAND}" >&2;
-      echo "${ec:-1}" > "outputs/$PlatformName/exit.code";
+trap 'ec=$?; ts=$(date "+%F %T"); src="${BASH_SOURCE[0]:-$0}"; fn="${FUNCNAME[0]:-main}";
+      echo "[$ts] ERROR ${ec:-1} at ${src}:${LINENO}: ${fn}: ${BASH_COMMAND}" >&2;
+      echo "${ec:-1}" > "outputs/{{PLATFORM}}/exit.code";
       exit "${ec:-1}"' ERR
-trap 'ec=$?; echo "${ec:-0}" > "outputs/$PlatformName/exit.code"' EXIT
+trap 'ec=$?; echo "${ec:-0}" > "outputs/{{PLATFORM}}/exit.code"' EXIT
 
 # Optional CF login if env exports exist
-if [ -n "${CF_API:-}" ] && [ -n "${CF_USERNAME:-}" ] && [ -n "${CF_PASSWORD:-}" ]; then
+if [ -n "${CF_API:-}" ] && [ -n "${CF_USERNAME:-}" ] && [ -n "${CF_PASSWORD:-}" ] ; then
   cf login -a "$CF_API" -u "$CF_USERNAME" -p "$CF_PASSWORD" -o system -s system
 fi
 
-$cmdInner
+{{CMD_INNER}}
 __RUN__
-"@
+'@
+
+  # Literal replacements (no PowerShell interpolation)
+  $tmpl = $tmpl.Replace('{{ENV_BLOCK}}', $EnvBlock)
+  $tmpl = $tmpl.Replace('{{SOURCE_CMD}}', $SourceCmd)
+  $tmpl = $tmpl.Replace('{{REMOTE_DIR}}', $RemoteRunDir)
+  $tmpl = $tmpl.Replace('{{PLATFORM}}', $PlatformName)
+  $tmpl = $tmpl.Replace('{{CMD_INNER}}', $cmdInner)
+  return $tmpl
 }
 
 function QuickProbe-Platform {
-  <# After launch, verify PID appears or exit.code is created. #>
   param(
     $EnvCfg, [string]$RemoteRunDir, [string]$PlatformName,
     [int]$Checks = 2, [int]$DelaySec = 5
   )
-  for ($i=0; $i -lt $Checks; $i++) {
-    $probe = Invoke-SSH -EnvCfg $EnvCfg -RemoteCommand @"
-if [ ! -d '$RemoteRunDir/outputs/$PlatformName' ]; then echo __MISSING__; exit; fi
-if [ -f '$RemoteRunDir/outputs/$PlatformName/exit.code' ]; then cat '$RemoteRunDir/outputs/$PlatformName/exit.code'; exit; fi
-if [ -f '$RemoteRunDir/outputs/$PlatformName/pid' ]; then
-  pid=\$(cat '$RemoteRunDir/outputs/$PlatformName/pid' 2>/dev/null)
-  if [ -n "\$pid" ] && kill -0 "\$pid" 2>/dev/null; then echo __RUNNING__; exit; fi
+
+$probeTemplate = @'
+if [ ! -d '<<RD>>/outputs/<<PL>>' ]; then echo __MISSING__; exit; fi
+if [ -f '<<RD>>/outputs/<<PL>>/exit.code' ]; then cat '<<RD>>/outputs/<<PL>>/exit.code'; exit; fi
+if [ -f '<<RD>>/outputs/<<PL>>/pid' ]; then
+  pid=$(cat '<<RD>>/outputs/<<PL>>/pid' 2>/dev/null)
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo __RUNNING__; exit; fi
 fi
 echo __PENDING__
-"@
+'@
+
+  $probeCmd = $probeTemplate.Replace('<<RD>>', $RemoteRunDir).Replace('<<PL>>', $PlatformName)
+
+  for ($i=0; $i -lt $Checks; $i++) {
+    $probe = Invoke-SSH -EnvCfg $EnvCfg -RemoteCommand $probeCmd
     $val = $probe.StdOut.Trim()
     if ($val -ne '__PENDING__') { return $val }
     Start-Sleep -Seconds $DelaySec
@@ -283,35 +289,36 @@ echo __PENDING__
   return '__PENDING__'
 }
 
+
 function Check-PlatformStatus {
-  <#
-    Returns one of:
-      Running, Finished, Missing
-    Plus ExitCode (if finished)
-  #>
   param($EnvCfg, [string]$RemoteRunDir, [string]$PlatformName)
-  $res = Invoke-SSH -EnvCfg $EnvCfg -RemoteCommand @"
-if [ ! -d '$RemoteRunDir/outputs/$PlatformName' ]; then echo STATE=Missing; exit; fi
-if [ -f '$RemoteRunDir/outputs/$PlatformName/exit.code' ]; then
-  ec=\$(cat '$RemoteRunDir/outputs/$PlatformName/exit.code' 2>/dev/null)
-  if [[ "\$ec" =~ ^[0-9]+$ ]]; then echo STATE=Finished EC=\$ec; else echo STATE=Finished EC=1; fi
+
+$statusTemplate = @'
+if [ ! -d '<<RD>>/outputs/<<PL>>' ]; then echo STATE=Missing; exit; fi
+if [ -f '<<RD>>/outputs/<<PL>>/exit.code' ]; then
+  ec=$(cat '<<RD>>/outputs/<<PL>>/exit.code' 2>/dev/null)
+  if [[ "$ec" =~ ^[0-9]+$ ]]; then echo STATE=Finished EC=$ec; else echo STATE=Finished EC=1; fi
   exit
 fi
-if [ -f '$RemoteRunDir/outputs/$PlatformName/pid' ]; then
-  pid=\$(cat '$RemoteRunDir/outputs/$PlatformName/pid' 2>/dev/null)
-  if [ -n "\$pid" ] && kill -0 "\$pid" 2>/dev/null; then echo STATE=Running; exit; fi
+if [ -f '<<RD>>/outputs/<<PL>>/pid' ]; then
+  pid=$(cat '<<RD>>/outputs/<<PL>>/pid' 2>/dev/null)
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo STATE=Running; exit; fi
 fi
 echo STATE=Running
-"@
+'@
+
+  $cmd = $statusTemplate.Replace('<<RD>>', $RemoteRunDir).Replace('<<PL>>', $PlatformName)
+  $res = Invoke-SSH -EnvCfg $EnvCfg -RemoteCommand $cmd
   $stdout = $res.StdOut.Trim()
-  if ($stdout -match 'STATE=Missing') { return [pscustomobject]@{ State='Missing'; ExitCode=$null } }
+  if ($stdout -match 'STATE=Missing') { return [pscustomobject]@{ State='Missing';  ExitCode=$null } }
   if ($stdout -match 'STATE=Finished EC=(\d+)') { return [pscustomobject]@{ State='Finished'; ExitCode=[int]$Matches[1] } }
   return [pscustomobject]@{ State='Running'; ExitCode=$null }
 }
 
+
 function Download-PlatformOutputs {
   param($EnvCfg, [string]$RemoteRunDir, [string]$PlatformName, [string]$LocalRoot)
-  $localOut = Join-Path $LocalRoot $PlatformName
+  $localOut = [IO.Path]::Combine($LocalRoot, $PlatformName)
   New-LocalDir $localOut
   Invoke-SCPDownload -EnvCfg $EnvCfg -RemotePathGlob "$RemoteRunDir/outputs/$PlatformName/*" -LocalDir $localOut
 }
@@ -402,7 +409,7 @@ if (-not $Resume) {
         $script = Get-RemoteScriptDetached -RemoteRunDir $remoteRunDir -PlatformName $platformName -Api $api -EnvBlock $envBlock -SourceCmd $sourceCmd -Commands $commandsToRun
         $launch = Invoke-SSH -EnvCfg $envCfg -RemoteCommand $script
         if ($launch.ExitCode -ne 0) {
-          Write-Warning "Launch failed on $($envCfg.Name)/$platformName: $($launch.StdErr)"
+          Write-Warning "Launch failed on $($envCfg.Name)/${platformName}: $($launch.StdErr)"
           continue
         }
 
@@ -461,8 +468,7 @@ while ($true) {
     # If remote run dir missing (e.g., cleaned up outside), mark invalid and advise
     $dirCheck = Invoke-SSH -EnvCfg $task.EnvCfg -RemoteCommand "test -d '$($task.RemoteRunDir)' && echo OK || echo MISS"
     if ($dirCheck.StdOut.Trim() -eq 'MISS') {
-      Write-Warning ("[{0}] {1}/{2}: remote run dir missing for tag {3}. Treating as invalid. Check your local outputs."
-                     -f (Get-Date), $task.EnvName, $task.PlatformName, $RunTag)
+      Write-Warning ("[{0}] {1}/{2}: remote run dir missing for tag {3}. Treating as invalid. Check your local outputs." -f (Get-Date), $task.EnvName, $task.PlatformName, $RunTag)
       $task.Done = $true
       $task.ExitCode = $null
       continue
@@ -472,16 +478,14 @@ while ($true) {
     switch ($st.State) {
       'Finished' {
         # download outputs then mark done
-        $localRoot = Join-Path $OutRoot (Join-Path $task.EnvName $task.PlatformName)
+        $localRoot = [IO.Path]::Combine($OutRoot, [IO.Path]::Combine($task.EnvName, $task.PlatformName))
         Download-PlatformOutputs -EnvCfg $task.EnvCfg -RemoteRunDir $task.RemoteRunDir -PlatformName $task.PlatformName -LocalRoot $localRoot
         $task.Done = $true
         $task.ExitCode = $st.ExitCode
-        Write-Host ("[{0}] {1}/{2} -> exit {3}"
-          -f (Get-Date).ToString('HH:mm:ss'), $task.EnvName, $task.PlatformName, $st.ExitCode)
+        Write-Host ("[{0}] {1}/{2} -> exit {3}" -f (Get-Date).ToString('HH:mm:ss'), $task.EnvName, $task.PlatformName, $st.ExitCode)
       }
       'Missing' {
-        Write-Warning ("[{0}] {1}/{2}: outputs folder missing; run may have been manually removed."
-          -f (Get-Date).ToString('HH:mm:ss'), $task.EnvName, $task.PlatformName)
+        Write-Warning ("[{0}] {1}/{2}: outputs folder missing; run may have been manually removed." -f (Get-Date).ToString('HH:mm:ss'), $task.EnvName, $task.PlatformName)
         $task.Done = $true
       }
       default {
