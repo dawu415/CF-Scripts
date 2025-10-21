@@ -249,7 +249,7 @@ function Invoke-SSH {
   # Anything printed by the server before our marker (legal banners, MOTD, etc.)
   # will be sliced away in the post-processing step below.
   # SAFE: no inner single quotes; prints a marker to stdout and stderr, then executes the payload
-  $remote = "bash --noprofile --norc -lc 'printf %s\n __CFORCH__; >&2 printf %s\n __CFORCH__; base64 -d <<< $encodedcmd | bash -s'"
+  $remote = "bash --noprofile --norc -lc 'printf %s\n __CFORCH__; >&2 printf %s\n __CFORCH__; base64 -d <<< $encodedcmd | env -u BASH_ENV PATH=/usr/bin:/bin bash --noprofile --norc -s'"
 
   if ($script:TraceSSH) {
     $bytes = [Text.Encoding]::UTF8.GetByteCount($payload)
@@ -654,11 +654,19 @@ ls -l inf.sh cf 2>/dev/null || true
     Write-Host "[TRACE] post-upload verify ($($EnvCfg.Name)):`n$($post.StdOut)" -ForegroundColor DarkGray
   }
 
-  # 4) Hard verify and fail fast if missing
-  $verify = Invoke-SSH -EnvCfg $EnvCfg -RemoteCommand "[ -f '$RemoteRunDir/inf.sh' ] && [ -x '$RemoteRunDir/cf' ] && echo OK || echo MISS" -HardTimeoutSec $SshHardTimeoutSec
-  if ($verify.StdOut.Trim() -ne 'OK') {
-    throw "Remote artifacts missing/invalid on $($EnvCfg.Name). Expected inf.sh and executable cf under $RemoteRunDir.`n$($post.StdOut)`n$($post.StdErr)"
+  # Escape single quotes just like we did earlier, to be perfectly safe
+  function _Esc([string]$s) { $s -replace "'", "'\''" }
+  $rrdEsc = _Esc $RemoteRunDir
+
+  # 4) Hard verify and fail fast if missing (use exit code)
+  $verifyCmd = "[ -f '$rrdEsc/inf.sh' ] && [ -x '$rrdEsc/cf' ]"
+  $verify = Invoke-SSH -EnvCfg $EnvCfg -RemoteCommand $verifyCmd -HardTimeoutSec $SshHardTimeoutSec
+
+  if ($verify.ExitCode -ne 0) {
+    $ls = Invoke-SSH -EnvCfg $EnvCfg -RemoteCommand "ls -l '$rrdEsc/inf.sh' '$rrdEsc/cf' 2>&1 || true" -HardTimeoutSec $SshHardTimeoutSec
+    throw "Remote artifacts missing/invalid on $($EnvCfg.Name). Expected inf.sh and executable cf under $RemoteRunDir.`n$($ls.StdOut)`n$($ls.StdErr)"
   }
+
 }
 
 
