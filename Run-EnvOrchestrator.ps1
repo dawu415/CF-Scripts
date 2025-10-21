@@ -286,8 +286,8 @@ function Invoke-SSH {
     $idx = $txt.LastIndexOf($m)
     if ($idx -lt 0) { return $txt.Trim() }
     $start = $idx + $m.Length
-    # skip one trailing newline after the marker if present
-    if ($start -lt $txt.Length -and ($txt[$start] -eq "`n" -or $txt[$start] -eq "`r")) { $start++ }
+    # skip all immediate CR/LF characters right after the marker
+    while ($start -lt $txt.Length -and (([int][char]$txt[$start]) -in 10,13)) { $start++ }
     return $txt.Substring($start).Trim()
   }
   $out = Slice-AfterMarker $out $marker
@@ -604,17 +604,54 @@ $work = foreach ($envCfg in $Environments) {
 # Helper to prepare remote dir + uploads (idempotent)
 function Ensure-Remote-Basics {
   param($EnvCfg, [string]$RemoteRunDir)
-  $mk   = Invoke-SSH -EnvCfg $EnvCfg -RemoteCommand "mkdir -p '$RemoteRunDir' && ls -ld '$RemoteRunDir'" -HardTimeoutSec $SshHardTimeoutSec
+
+  # 1) Make sure run dir exists
+  $mk = Invoke-SSH -EnvCfg $EnvCfg -RemoteCommand "mkdir -p '$RemoteRunDir' && ls -ld '$RemoteRunDir'" -HardTimeoutSec $SshHardTimeoutSec
   if ($mk.ExitCode -ne 0) { throw "Failed to prepare remote dir for $($EnvCfg.Name): $($mk.StdErr)" }
 
-  $need = Invoke-SSH -EnvCfg $EnvCfg -RemoteCommand @"
-test -x '$RemoteRunDir/cf' && test -f '$RemoteRunDir/inf.sh' && echo OK || echo NEED
-"@ -HardTimeoutSec $SshHardTimeoutSec
-  if ($need.StdOut.Trim() -eq 'NEED') {
-    Invoke-SCPUpload -EnvCfg $EnvCfg -LocalPaths @($LocalFiles.CfBinary, $LocalFiles.InfScript) -RemoteDir $RemoteRunDir
-    [void](Invoke-SSH -EnvCfg $EnvCfg -RemoteCommand "chmod +x '$RemoteRunDir/cf' '$RemoteRunDir/inf.sh' || true" -HardTimeoutSec $SshHardTimeoutSec)
+  # 2) ALWAYS push both artifacts (simpler + robust)
+  Invoke-SCPUpload -EnvCfg $EnvCfg -LocalPaths @($LocalFiles.CfBinary, $LocalFiles.InfScript) -RemoteDir $RemoteRunDir
+
+  # 3) Normalize names & permissions on remote and show a quick verify when tracing
+  $infLeafLocal = [IO.Path]::GetFileName($LocalFiles.InfScript)
+  $fix = @"
+set -Eeuo pipefail
+cd '$RemoteRunDir'
+
+# If the script isn't named exactly inf.sh, rename it so the launcher can ./inf.sh
+if [ ! -f inf.sh ]; then
+  if [ -f '$infLeafLocal' ]; then
+    mv -f '$infLeafLocal' inf.sh
+  else
+    # as a fallback: if exactly one *.sh exists, make it inf.sh
+    cnt=\$(ls -1 *.sh 2>/dev/null | wc -l | tr -d ' ')
+    if [ "\$cnt" = "1" ]; then mv -f \$(ls -1 *.sh) inf.sh; fi
+  fi
+fi
+
+# If cf arrived as cf.exe, unify to cf
+[ -f cf.exe ] && mv -f cf.exe cf
+
+# Ensure exec bits
+chmod +x cf 2>/dev/null || true
+chmod +x inf.sh 2>/dev/null || true
+
+# Show what we have (helps when -TraceSSH is on)
+ls -l inf.sh cf 2>/dev/null || true
+"@
+
+  $post = Invoke-SSH -EnvCfg $EnvCfg -RemoteCommand $fix -HardTimeoutSec $SshHardTimeoutSec
+  if ($script:TraceSSH) {
+    Write-Host "[TRACE] post-upload verify ($($EnvCfg.Name)):`n$($post.StdOut)" -ForegroundColor DarkGray
+  }
+
+  # 4) Hard verify and fail fast if missing
+  $verify = Invoke-SSH -EnvCfg $EnvCfg -RemoteCommand "[ -f '$RemoteRunDir/inf.sh' ] && [ -x '$RemoteRunDir/cf' ] && echo OK || echo MISS" -HardTimeoutSec $SshHardTimeoutSec
+  if ($verify.StdOut.Trim() -ne 'OK') {
+    throw "Remote artifacts missing/invalid on $($EnvCfg.Name). Expected inf.sh and executable cf under $RemoteRunDir.`n$($post.StdOut)`n$($post.StdErr)"
   }
 }
+
 
 # LAUNCH PHASE (unless -Resume)
 if (-not $Resume) {
@@ -677,6 +714,8 @@ if (-not $Resume) {
         $qp = QuickProbe-Platform -EnvCfg $envCfg -RemoteRunDir $remoteRunDir -PlatformName $platformName -Checks $QuickChecks -DelaySec $QuickDelaySec
         if ($qp -in '__RUNNING__','0','__PENDING__') {
           Write-Host ("  -> {0}/{1} launched: {2}" -f $envCfg.Name,$platformName,$qp) -ForegroundColor DarkGray
+        } elseif ($qp -match '^\d+$') {
+          Write-Warning ("  -> {0}/{1} exited immediately with code {2}" -f $envCfg.Name,$platformName,$qp)
         } else {
           Write-Warning ("  -> {0}/{1} early status: {2}" -f $envCfg.Name,$platformName,$qp)
         }
