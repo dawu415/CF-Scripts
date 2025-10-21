@@ -213,9 +213,9 @@ echo "__NOEXEC__"
     throw "Failed to probe remote base dir on $($EnvCfg.Name): $($res.StdErr)"
   }
 
-  $raw   = $res.StdOut
-  $lines = $raw -split "\r?\n" | Where-Object { $_ -and $_.Trim() }
-  $base  = if ($lines) { $lines[-1].Trim() } else { "" }
+  $raw = ($res.StdOut -replace '\r\n', "`n")  # normalize CRLF to LF
+  $base = ($raw -split "\r?\n" | Where-Object { $_ -and $_.Trim() } | Select-Object -Last 1)
+  $base = if ($base) { $base.Trim() } else { "" }
 
   if ([string]::IsNullOrWhiteSpace($base) -or $base -eq '__NOEXEC__') {
     $dbgTrail = ($lines | Where-Object { $_ -like 'DBG:*' }) -join [environment]::NewLine
