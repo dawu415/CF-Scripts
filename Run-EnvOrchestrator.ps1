@@ -116,7 +116,7 @@ set -Eeuo pipefail
 # Build candidate list (optional preferred path first)
 candidates=()
 if [ -n "$PREF" ]; then candidates+=("$PREF"); fi
-candidates+=("$HOME/.cf_orch" "/var/tmp" "/dev/shm" "/tmp")
+candidates+=("/tmp" "$HOME/.cf_orch" "/var/tmp")
 
 # If this run tag already exists under any candidate, prefer that
 for base in "${candidates[@]}"; do
