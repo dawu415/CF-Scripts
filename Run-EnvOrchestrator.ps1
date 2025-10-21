@@ -130,9 +130,8 @@ function Get-SshBaseArgs {
 
 function Get-RemoteRunDir {
   <#
-    Select an exec-capable writable base directory on the remote and
-    return "<base>/_run_<RunTag>". Honors an optional per-env override
-    property: $EnvCfg.RemoteBase (if present).
+    Pick an exec-capable writable base dir on the remote and return "<base>/_run_<RunTag>".
+    Honors optional $EnvCfg.RemoteBase. Emits debug when -TraceSSH is on.
   #>
   param(
     [Parameter(Mandatory)] $EnvCfg,
@@ -144,48 +143,105 @@ function Get-RemoteRunDir {
     $pref = $EnvCfg.RemoteBase
   }
 
+  # Build the probe with light, prefixed debug (DBG:) so we can parse easily.
   $probe = @'
 RUN_TAG="__TAG__"
 PREF="__PREF__"
 set -Eeuo pipefail
 
-# Build candidate list (optional preferred path first)
+dbg() { :; }  # default no-op
+if [ -n "${CF_ORCH_TRACE:-}" ]; then
+  dbg() { printf "DBG:%s\n" "$*"; }
+fi
+
+# ensure HOME exists; fall back if empty
+if [ -z "${HOME:-}" ]; then
+  HOME="$(getent passwd "$(id -un 2>/dev/null)" 2>/dev/null | awk -F: "{print \$6}")"
+  dbg "HOME_fallback=$HOME"
+fi
+
 candidates=()
-if [ -n "$PREF" ]; then candidates+=("$PREF"); fi
+[ -n "$PREF" ] && candidates+=("$PREF")
 candidates+=("/tmp" "$HOME/.cf_orch")
 
-# If this run tag already exists under any candidate, prefer that
+dbg "RUN_TAG=$RUN_TAG"
+dbg "candidates=${candidates[*]}"
+
+# If this run tag dir already exists anywhere, use that base
 for base in "${candidates[@]}"; do
   if [ -d "$base/_run_$RUN_TAG" ]; then
+    dbg "reuse=$base"
     echo "$base"
     exit 0
   fi
 done
 
-# Otherwise find the first exec-capable, writable base
 TRUEBIN="$(command -v true 2>/dev/null || echo /bin/true)"
 for base in "${candidates[@]}"; do
-  mkdir -p "$base" >/dev/null 2>&1 || continue
-  [ -w "$base" ] || continue
+  dbg "try=$base"
+
+  # Must be creatable and writable
+  mkdir -p "$base" >/dev/null 2>&1 || { dbg "mkdir_fail=$base"; continue; }
+  [ -w "$base" ] || { dbg "not_writable=$base"; continue; }
+
+  # Skip known 'noexec' mounts if we can detect them
+  if command -v findmnt >/dev/null 2>&1; then
+    if findmnt -no OPTIONS --target "$base" 2>/dev/null | grep -qw noexec; then
+      dbg "noexec_mount=$base"
+      continue
+    fi
+  fi
+
   t="$base/.exec_test_$$"
-  cp "$TRUEBIN" "$t" >/dev/null 2>&1 || continue
-  chmod +x "$t" >/dev/null 2>&1 || { rm -f "$t"; continue; }
-  "$t" >/dev/null 2>&1 && { rm -f "$t"; echo "$base"; exit 0; }
+  cp "$TRUEBIN" "$t" >/dev/null 2>&1 || { dbg "cp_fail=$base"; continue; }
+  chmod +x "$t" >/dev/null 2>&1 || { rm -f "$t"; dbg "chmod_fail=$base"; continue; }
+
+  if "$t" >/dev/null 2>&1; then
+    rm -f "$t" >/dev/null 2>&1 || true
+    dbg "exec_ok=$base"
+    echo "$base"
+    exit 0
+  fi
+
   rm -f "$t" >/dev/null 2>&1 || true
+  dbg "exec_fail=$base"
 done
 
 echo "__NOEXEC__"
 '@
 
   $probe = $probe.Replace('__TAG__', $RunTag).Replace('__PREF__', $pref)
-  $res   = Invoke-SSH -HardTimeoutSec $SshHardTimeoutSec -EnvCfg $EnvCfg -RemoteCommand $probe
+
+  # Pass CF_ORCH_TRACE flag into the remote so the probe emits DBG lines when -TraceSSH is used
+  $remoteWithTrace = if ($script:TraceSSH) {
+    "export CF_ORCH_TRACE=1; $probe"
+  } else {
+    $probe
+  }
+
+  $res = Invoke-SSH -EnvCfg $EnvCfg -RemoteCommand $remoteWithTrace -HardTimeoutSec $SshHardTimeoutSec
+
   if ($res.ExitCode -ne 0) {
     throw "Failed to probe remote base dir on $($EnvCfg.Name): $($res.StdErr)"
   }
-  $base = ($res.StdOut -split "\r?\n" | Where-Object { $_ -and $_.Trim() } | Select-Object -Last 1).Trim()
+
+  # Keep the full (banner-stripped) stdout for debugging, then pick the last non-empty line as the result
+  $raw = $res.StdOut
+  $lines = $raw -split "\r?\n" | Where-Object { $_ -and $_.Trim() }
+  $base = if ($lines) { $lines[-1].Trim() } else { "" }
+
   if ([string]::IsNullOrWhiteSpace($base) -or $base -eq '__NOEXEC__') {
-    throw "No exec-capable writable directory found on $($EnvCfg.Name). Set EnvCfg.RemoteBase to a path (e.g. /home/<user>/.cf_orch) or ask ops to allow an exec-capable scratch dir."
+    # Add the probe’s own debug trail to the exception for quick diagnosis
+    $dbgTrail = ($lines | Where-Object { $_ -like 'DBG:*' }) -join [environment]::NewLine
+    $hint = "No exec-capable writable directory found on $($EnvCfg.Name). " +
+            "Set EnvCfg.RemoteBase (e.g. /home/<user>/.cf_orch) or ask ops for an exec-capable scratch dir."
+    if ($dbgTrail) {
+      throw "$hint`nProbe debug:`n$dbgTrail"
+    } else {
+      throw $hint
+    }
   }
+
   return ([IO.Path]::Combine($base, "_run_$RunTag") -replace '\\','/')
 }
 
@@ -209,7 +265,7 @@ function Invoke-SSH {
   # Anything printed by the server before our marker (legal banners, MOTD, etc.)
   # will be sliced away in the post-processing step below.
   # SAFE: no inner single quotes; prints a marker to stdout and stderr, then executes the payload
-  $remote = "bash --noprofile --norc -lc 'printf %s\\n __CFORCH__; >&2 printf %s\\n __CFORCH__; base64 -d <<< $encodedcmd | bash -s'"
+  $remote = "bash --noprofile --norc -lc 'printf %s\n __CFORCH__; >&2 printf %s\n __CFORCH__; base64 -d <<< $encodedcmd | bash -s'"
 
   if ($script:TraceSSH) {
     $bytes = [Text.Encoding]::UTF8.GetByteCount($payload)
