@@ -234,10 +234,17 @@ export CF_HOME='{{REMOTE_DIR}}/.cf/{{PLATFORM}}'
 chmod +x inf.sh cf || true
 rm -f outputs/{{PLATFORM}}/pid outputs/{{PLATFORM}}/exit.code || true
 
+# --- ensure our uploaded ./cf is found everywhere ---
+export PATH='{{REMOTE_DIR}}':"$PATH"
+
 # Use a quoted heredoc so the *outer* shell doesn't expand;
 # the inner bash will execute/expand it normally.
 nohup bash --noprofile --norc >"outputs/{{PLATFORM}}/run.out" 2>"outputs/{{PLATFORM}}/run.err" <<'__RUN__' & echo $! > "outputs/{{PLATFORM}}/pid"
 set -Eeuo pipefail
+
+# Make sure PATH is correct inside the child shell as well
+export PATH="$PWD:$PATH"
+
 trap 'ec=$?; ts=$(date "+%F %T"); src="${BASH_SOURCE[0]:-$0}"; fn="${FUNCNAME[0]:-main}";
       echo "[$ts] ERROR ${ec:-1} at ${src}:${LINENO}: ${fn}: ${BASH_COMMAND}" >&2;
       echo "${ec:-1}" > "outputs/{{PLATFORM}}/exit.code";
@@ -253,12 +260,12 @@ fi
 __RUN__
 '@
 
-  # Literal replacements (no PowerShell interpolation)
-  $tmpl = $tmpl.Replace('{{ENV_BLOCK}}', $EnvBlock)
-  $tmpl = $tmpl.Replace('{{SOURCE_CMD}}', $SourceCmd)
-  $tmpl = $tmpl.Replace('{{REMOTE_DIR}}', $RemoteRunDir)
-  $tmpl = $tmpl.Replace('{{PLATFORM}}', $PlatformName)
-  $tmpl = $tmpl.Replace('{{CMD_INNER}}', $cmdInner)
+  $tmpl = $tmpl.Replace('{{ENV_BLOCK}}', $EnvBlock).
+                Replace('{{SOURCE_CMD}}', $SourceCmd).
+                Replace('{{REMOTE_DIR}}', $RemoteRunDir).
+                Replace('{{PLATFORM}}', $PlatformName).
+                Replace('{{CMD_INNER}}', $cmdInner)
+
   return $tmpl
 }
 
@@ -407,6 +414,7 @@ if (-not $Resume) {
 
         # launch detached
         $script = Get-RemoteScriptDetached -RemoteRunDir $remoteRunDir -PlatformName $platformName -Api $api -EnvBlock $envBlock -SourceCmd $sourceCmd -Commands $commandsToRun
+        Write-Host $script
         $launch = Invoke-SSH -EnvCfg $envCfg -RemoteCommand $script
         if ($launch.ExitCode -ne 0) {
           Write-Warning "Launch failed on $($envCfg.Name)/${platformName}: $($launch.StdErr)"
