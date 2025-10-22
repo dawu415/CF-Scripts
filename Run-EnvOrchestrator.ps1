@@ -108,6 +108,7 @@ function Get-SshBaseArgs {
   param($EnvCfg)
   $envargs = @(
     "-T",
+    "-n",                      # <<< NEW: don't read from STDIN (prevents odd stalls)
     "-q",                       # quiet client output
     "-p", $EnvCfg.Port.ToString(),
     "-o","LogLevel=ERROR",      # suppress warnings/banners from the client
@@ -189,7 +190,7 @@ for base in "${candidates[@]}"; do
 
   # --- EXEC TEST: write & run a tiny script in-place ---
   t="$base/.exec_test_$$.sh"
-  printf '#!/bin/sh\nexit 0\n' > "$t" 2>/dev/null || { dbg "write_fail=$base"; continue; }
+  printf "#!/bin/sh\nexit 0\n" > "$t" 2>/dev/null || { dbg "write_fail=$base"; continue; }
   chmod +x "$t" >/dev/null 2>&1 || { rm -f "$t"; dbg "chmod_fail=$base"; continue; }
   if "$t" >/dev/null 2>&1; then
     rm -f "$t" >/dev/null 2>&1 || true
@@ -241,13 +242,11 @@ function Invoke-SSH {
   $payload    = ($RemoteCommand -replace "`r`n", "`n")
   $encodedcmd = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($payload))
 
-  # Use distinct markers for each stream to avoid any cross-stream ambiguity
   $markerOut = "__CFORCH_OUT__"
   $markerErr = "__CFORCH_ERR__"
 
-  # Print a marker to STDOUT and a different one to STDERR, then run the payload.
-  # Quote printf's format so \n is handled by printf, not the shell.
-  $remote = "bash --noprofile --norc -lc 'printf `"%s\n`" $markerOut; printf `"%s\n`" $markerErr 1>&2; " +
+  # Print per-stream markers, then run the payload under a quiet bash with a minimal PATH.
+  $remote = "bash --noprofile --norc -lc 'printf `"%s\n`" `"$markerOut`"; printf `"%s\n`" `"$markerErr`" 1>&2; " +
             "base64 -d <<< $encodedcmd | env -u BASH_ENV PATH=/usr/bin:/bin bash --noprofile --norc -s'"
 
   if ($script:TraceSSH) {
@@ -280,19 +279,26 @@ function Invoke-SSH {
   $err = $proc.StandardError.ReadToEnd()
   $proc.WaitForExit()
 
-  # --- strip server banners: take content after our per-stream markers ---
   function Slice-AfterMarker([string]$txt, [string]$m) {
     if ([string]::IsNullOrEmpty($txt)) { return $txt }
     $idx = $txt.LastIndexOf($m)
     if ($idx -lt 0) { return $txt.Trim() }
     $start = $idx + $m.Length
-    # skip CR/LF/TAB/SPACE right after the marker
+    # Skip CR/LF/TAB/SPACE immediately after the marker
     while ($start -lt $txt.Length -and (([int][char]$txt[$start]) -in 9,10,13,32)) { $start++ }
-    return $txt.Substring($start).Trim()
+    return $txt.Substring($start)
   }
 
-  $out = Slice-AfterMarker $out $markerOut
-  $err = Slice-AfterMarker $err $markerErr
+  function Clean-AfterSlice([string]$s) {
+    if ($null -eq $s) { return $s }
+    $s = ($s -replace "`r`n","`n" -replace "`r","`n").Trim()
+    # If the *very first* character is a stray literal 'n' and the next token is a control token, drop it
+    if ($s -match '^(?:n)(__(?:RUNNING|PENDING|MISSING)__|STATE=.*|\d+|OK|MISS)$') { $s = $Matches[1] }
+    return $s
+  }
+
+  $out = Clean-AfterSlice (Slice-AfterMarker $out $markerOut)
+  $err = Clean-AfterSlice (Slice-AfterMarker $err $markerErr)
 
   return [pscustomobject]@{ ExitCode=$proc.ExitCode; StdOut=$out; StdErr=$err }
 }
@@ -449,6 +455,15 @@ __RUN__
   return $tmpl
 }
 
+function Normalize-ControlToken {
+  param([string]$s)
+  if ($null -eq $s) { return '' }
+  $s = ($s -replace "`r`n","`n" -replace "`r","`n").Trim()
+  if ($s -match '^(?:n)(__(?:RUNNING|PENDING|MISSING)__|STATE=.*|\d+|OK|MISS)$') { $s = $Matches[1] }
+  if ([string]::IsNullOrWhiteSpace($s)) { $s = '__PENDING__' }
+  return $s
+}
+
 function QuickProbe-Platform {
   param(
     $EnvCfg, [string]$RemoteRunDir, [string]$PlatformName,
@@ -469,11 +484,8 @@ echo __PENDING__
 
   for ($i=0; $i -lt $Checks; $i++) {
     $probe = Invoke-SSH -EnvCfg $EnvCfg -RemoteCommand $probeCmd -HardTimeoutSec $SshHardTimeoutSec
-    if ($probe.ExitCode -eq 255 -and $probe.StdErr -match 'HARD TIMEOUT') {
-      # Don’t block the batch on a slow host; treat as pending and move on
-      return '__PENDING__'
-    }
-    $val = $probe.StdOut.Trim()
+    if ($probe.ExitCode -eq 255 -and $probe.StdErr -match 'HARD TIMEOUT') { return '__PENDING__' }
+    $val = Normalize-ControlToken $probe.StdOut
     if ($val -ne '__PENDING__') { return $val }
     Start-Sleep -Seconds $DelaySec
   }
@@ -507,7 +519,7 @@ echo STATE=Pending
     return [pscustomobject]@{ State='Timeout'; ExitCode=$null }
   }
 
-  $stdout = $res.StdOut.Trim()
+  $stdout = Normalize-ControlToken $res.StdOut
   if ($stdout -match 'STATE=Missing')          { return [pscustomobject]@{ State='Missing';  ExitCode=$null } }
   if ($stdout -match 'STATE=Finished EC=(\d+)'){ return [pscustomobject]@{ State='Finished'; ExitCode=[int]$Matches[1] } }
   if ($stdout -match 'STATE=Running')          { return [pscustomobject]@{ State='Running';  ExitCode=$null } }
@@ -525,13 +537,19 @@ function Show-StatusTable {
   param(
     [Parameter(Mandatory)] $Tasks,
     [Parameter(Mandatory)] [int] $Round,
-    [Parameter(Mandatory)] [datetime] $Start,
+    [Parameter(Mandatory)] [datetime] $Start,   # pass $overallStart here
     [switch]$Clear
   )
   if ($Clear) { Clear-Host }
   $now = Get-Date
   $elapsed = New-TimeSpan -Start $Start -End $now
-  Write-Host ("[{0}] RunTag={1} | Poll round #{2} | elapsed {3:hh\:mm\:ss}" -f $now.ToString('HH:mm:ss'), $RunTag, $Round, $elapsed) -ForegroundColor Cyan
+
+  $total = $Tasks.Count
+  $done  = ($Tasks | Where-Object { $_.Done }).Count
+  $active= $total - $done
+
+  Write-Host ("[{0}] RunTag={1} | Round #{2} | Total {3:hh\:mm\:ss} | Active {4}/{5}" `
+              -f $now.ToString('HH:mm:ss'), $RunTag, $Round, $elapsed, $active, $total) -ForegroundColor Cyan
 
   # Build rows
   $rows = foreach ($t in $Tasks) {
@@ -546,35 +564,26 @@ function Show-StatusTable {
     $since = if ($t.PSObject.Properties.Name -contains 'LastStateChange' -and $t.LastStateChange) {
       (New-TimeSpan -Start $t.LastStateChange -End $now).ToString("hh\:mm\:ss")
     } else { "" }
-    [pscustomobject]@{
-      Env       = $t.EnvName
-      Platform  = $t.PlatformName
-      Status    = $disp
-      LastChange= $since
-    }
+    [pscustomobject]@{ Env=$t.EnvName; Platform=$t.PlatformName; Status=$disp; LastChange=$since }
   }
 
-  # Simple, immediate print (no AutoSize buffering)
   $rows = $rows | Sort-Object Env, Platform
 
   # Compute widths safely
-  $envLens  = @()
-  $platLens = @()
+  $envLens  = @(); $platLens = @()
   foreach ($r in $rows) { $envLens += $r.Env.Length; $platLens += $r.Platform.Length }
-  $maxEnv  = if ($envLens.Count)  { ($envLens  | Measure-Object -Maximum).Maximum } else { 3 }
-  $maxPlat = if ($platLens.Count) { ($platLens | Measure-Object -Maximum).Maximum } else { 8 }
-
-  $wEnv  = [Math]::Min(30, [Math]::Max(3, $maxEnv))
-  $wPlat = [Math]::Min(24, [Math]::Max(8, $maxPlat))
+  $wEnv  = [Math]::Min(30, [Math]::Max(3,  ($envLens  | Measure-Object -Maximum).Maximum))
+  $wPlat = [Math]::Min(24, [Math]::Max(8,  ($platLens | Measure-Object -Maximum).Maximum))
   $wStat = 28
   $fmt   = "{0,-$wEnv}  {1,-$wPlat}  {2,-$wStat}  {3,9}"
 
   Write-Host ($fmt -f 'Env','Platform','Status','LastChange')
   Write-Host ($fmt -f ('-'*$wEnv), ('-'*$wPlat), ('-'*$wStat), ('-'*9))
-  foreach ($r in $rows) {
-    Write-Host ($fmt -f $r.Env, $r.Platform, $r.Status, $r.LastChange)
-  }
+  foreach ($r in $rows) { Write-Host ($fmt -f $r.Env, $r.Platform, $r.Status, $r.LastChange) }
   Write-Host ""
+
+  # Force the console to paint immediately
+  [Console]::Out.Flush()
 }
 
 # -------------------------
@@ -834,7 +843,7 @@ while ($true) {
 
   # print heartbeat at the start of the round
   if ($StatusEvery -gt 0 -and (($round - 1) % $StatusEvery -eq 0)) {
-    Show-StatusTable -Tasks $pending -Round $round -Start $start -Clear:$WatchClear
+    Show-StatusTable -Tasks $pending -Round $round -Start $overallStart -Clear:$WatchClear
   }
 
   if (-not $remaining) { break }
@@ -883,7 +892,7 @@ while ($true) {
   }
 
   if ($StatusEvery -gt 0 -and ($round % $StatusEvery -eq 0)) {
-    Show-StatusTable -Tasks $pending -Round $round -Start $start -Clear:$WatchClear
+    Show-StatusTable -Tasks $pending -Round $round -Start $overallStart -Clear:$WatchClear
   }
 
   if ((Get-Date) - $start -gt [TimeSpan]::FromSeconds($TimeoutSec)) {
@@ -919,3 +928,15 @@ foreach ($task in $pending) {
   Write-Host ("{0}/{1}: {2}" -f $task.EnvName, $task.PlatformName, $status)
 }
 Write-Host ("Outputs root: {0}" -f $OutRoot)
+
+# Decide exit code: 0 if all Done with exit 0; 1 otherwise (includes Missing/Timeout)
+$allDone = ($pending | Where-Object { -not $_.Done }).Count -eq 0
+$anyFail = ($pending | Where-Object {
+  $_.Done -and (
+    ($_.State -eq 'Finished' -and ($_.ExitCode -ne 0 -and $null -ne $_.ExitCode)) -or
+    ($_.State -in @('Missing','Timeout'))
+  )
+}).Count -gt 0
+
+$code = if ($allDone -and -not $anyFail) { 0 } else { 1 }
+exit $code
