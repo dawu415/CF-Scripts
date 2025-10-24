@@ -400,8 +400,11 @@ function Get-RemoteScriptDetached {
     [string]$Api,
     [string]$EnvBlock = "",
     [string]$SourceCmd = "",
-    [string[]]$Commands = $null
+    [string[]]$Commands = $null,
+    [string]$CfSession = "" 
   )
+
+  $cfSess = if ([string]::IsNullOrWhiteSpace($CfSession)) { "default" } else { $CfSession }
 
   $cmdInner = if ($Commands -and $Commands.Count -gt 0) {
     ($Commands -join " && ")
@@ -416,9 +419,19 @@ set -Eeuo pipefail
 
 cd '{{REMOTE_DIR}}'
 mkdir -p outputs/{{PLATFORM}}
-export CF_HOME='{{REMOTE_DIR}}/.cf/{{PLATFORM}}'
+umask 077
+
+export CF_ORCH_RUN_DIR='{{REMOTE_DIR}}'
+export CF_ORCH_PLATFORM='{{PLATFORM}}'
+export CF_ORCH_OUT_DIR='{{REMOTE_DIR}}/outputs/{{PLATFORM}}'
+
+export CF_HOME='{{REMOTE_DIR}}/.cf/{{PLATFORM}}/{{CF_SESSION}}'
+mkdir -p "$CF_HOME"
 chmod +x inf.sh cf || true
 rm -f outputs/{{PLATFORM}}/pid outputs/{{PLATFORM}}/exit.code || true
+
+# Record session id for debugging/resume visibility
+echo '{{CF_SESSION}}' > "outputs/{{PLATFORM}}/cf_session"
 
 # --- ensure our uploaded ./cf is found everywhere ---
 export PATH='{{REMOTE_DIR}}':"$PATH"
@@ -439,7 +452,8 @@ trap 'ec=$?; echo "${ec:-0}" > "outputs/{{PLATFORM}}/exit.code"' EXIT
 
 # Optional CF login if env exports exist
 if [ -n "${CF_API:-}" ] && [ -n "${CF_USERNAME:-}" ] && [ -n "${CF_PASSWORD:-}" ] ; then
-  cf login -a "$CF_API" -u "$CF_USERNAME" -p "$CF_PASSWORD" -o system -s system
+  org="${CF_ORG:-system}"; space="${CF_SPACE:-system}"
+  cf login -a "$CF_API" -u "$CF_USERNAME" -p "$CF_PASSWORD" -o "$org" -s "$space"
 fi
 
 {{CMD_INNER}}
@@ -450,7 +464,8 @@ __RUN__
                 Replace('{{SOURCE_CMD}}', $SourceCmd).
                 Replace('{{REMOTE_DIR}}', $RemoteRunDir).
                 Replace('{{PLATFORM}}', $PlatformName).
-                Replace('{{CMD_INNER}}', $cmdInner)
+                Replace('{{CMD_INNER}}', $cmdInner).
+                Replace('{{CF_SESSION}}', $cfSess) 
 
   return $tmpl
 }
@@ -572,8 +587,10 @@ function Show-StatusTable {
   # Compute widths safely
   $envLens  = @(); $platLens = @()
   foreach ($r in $rows) { $envLens += $r.Env.Length; $platLens += $r.Platform.Length }
-  $wEnv  = [Math]::Min(30, [Math]::Max(3,  ($envLens  | Measure-Object -Maximum).Maximum))
-  $wPlat = [Math]::Min(24, [Math]::Max(8,  ($platLens | Measure-Object -Maximum).Maximum))
+  $maxEnv  = if ($envLens.Count)  { ($envLens  | Measure-Object -Maximum).Maximum } else { 3 }
+  $maxPlat = if ($platLens.Count) { ($platLens | Measure-Object -Maximum).Maximum } else { 8 }
+  $wEnv  = [Math]::Min(30, [Math]::Max(3,  $maxEnv))
+  $wPlat = [Math]::Min(24, [Math]::Max(8,  $maxPlat))
   $wStat = 28
   $fmt   = "{0,-$wEnv}  {1,-$wPlat}  {2,-$wStat}  {3,9}"
 
@@ -765,7 +782,9 @@ if (-not $Resume) {
           if ($val -is [string]) { $commandsToRun = @($val) } else { $commandsToRun = $val }
         }
 
-        $script = Get-RemoteScriptDetached -RemoteRunDir $remoteRunDir -PlatformName $platformName -Api $api -EnvBlock $envBlock -SourceCmd $sourceCmd -Commands $commandsToRun
+        $cfSession = "sess-$RunTag-$PID-$([Guid]::NewGuid().ToString('N').Substring(0,8))"
+
+        $script = Get-RemoteScriptDetached -RemoteRunDir $remoteRunDir -PlatformName $platformName -Api $api -EnvBlock $envBlock -SourceCmd $sourceCmd -Commands $commandsToRun  -CfSession $cfSession 
 
         if ($DebugLaunch -or $ShowLaunchScript) {
           $safe = Redact-Secrets $script

@@ -13,7 +13,26 @@ trap 'ec=$?; set +u;
       echo "[$ts] ERROR ${ec:-1} at ${src}:${LINENO}: ${fn}: ${BASH_COMMAND:-?}" >&2;
       exit "${ec:-1}"' ERR
 
+command -v cf  >/dev/null 2>&1 || { echo "cf CLI not found in PATH" >&2; exit 6; }
+command -v jq  >/dev/null 2>&1 || { echo "jq not found in PATH" >&2; exit 6; }
+command -v xargs >/dev/null 2>&1 || { echo "xargs not found" >&2; exit 6; }
+
 # ----------------------------- helpers -----------------------------
+
+csv_q() {  # quote one field per RFC4180
+  local s=${1//$'\r'/ }      # normalize hard CRs out
+  s=${s//$'\n'/ }            # strip newlines (or replace with space)
+  s=${s//\"/\"\"}            # escape quotes
+  printf '"%s"' "$s"
+}
+csv_row() {  # join fields with commas, quoting each
+  local sep=""
+  for f in "$@"; do
+    printf "%s" "$sep"; csv_q "$f"; sep=","
+  done
+  printf "\n"
+}
+
 # --- v2 pagination: follow .next_url, merge resources (safe; uses jq -s) ---
 fetch_all_pages_v2() {
     local base_path="$1"
@@ -66,21 +85,46 @@ fetch_all_pages_v3() {
 }
 
 
-# Cache heavy catalogs to files so every worker can read them safely
-TMP_ROOT="${TMPDIR:-/tmp}"
-WORK_DIR="$(mktemp -d "${TMP_ROOT%/}/cf_collect.XXXXXX")"
+# ----------------------------- cache root -----------------------------
+# Prefer to keep caches under the run's outputs/<platform>/cache so they
+# are per-run/per-platform and automatically collected by the orchestrator.
+ORCH_OUT_DIR="${CF_ORCH_OUT_DIR:-"$PWD/outputs/${CF_ORCH_PLATFORM:-default}"}"
+CACHE_ROOT="${CF_ORCH_CACHE_ROOT:-"$ORCH_OUT_DIR/cache"}"
+
+mkdir -p "$CACHE_ROOT"
+
+echo "Using cache root: $CACHE_ROOT" >&2
+
+# A per-process scratch area under the cache root
+WORK_DIR="$(mktemp -d "${CACHE_ROOT%/}/work.XXXXXX")"
 cleanup(){ rm -rf "$WORK_DIR"; }
 trap cleanup EXIT
 
-BUILDPACKS_JSON_FILE="$WORK_DIR/buildpacks.json"
-SPACES_JSON_FILE="$WORK_DIR/spaces.json"
-ORGS_JSON_FILE="$WORK_DIR/orgs.json"
-STACKS_JSON_FILE="$WORK_DIR/stacks.json"
+# Canonical cache file paths (shared by workers of this run)
+BUILDPACKS_JSON_FILE="$CACHE_ROOT/buildpacks.json"
+SPACES_JSON_FILE="$CACHE_ROOT/spaces.json"
+ORGS_JSON_FILE="$CACHE_ROOT/orgs.json"
+STACKS_JSON_FILE="$CACHE_ROOT/stacks.json"
 
-cf curl "/v2/buildpacks?results-per-page=100" 2>/dev/null >"$BUILDPACKS_JSON_FILE" || echo '{}' >"$BUILDPACKS_JSON_FILE"
-fetch_all_pages_v2 "/v2/spaces"        >"$SPACES_JSON_FILE"
-fetch_all_pages_v2 "/v2/organizations" >"$ORGS_JSON_FILE"
-fetch_all_pages_v2 "/v2/stacks"        >"$STACKS_JSON_FILE"
+
+#---------------------------- preload caches -----------------------------
+# Use temp files + mv to avoid partial writes if interrupted
+tmp_bp="$(mktemp "${CACHE_ROOT%/}/.buildpacks.json.tmp.XXXXXX")"
+cf curl "/v2/buildpacks?results-per-page=100" 2>/dev/null >"$tmp_bp" || echo '{}' >"$tmp_bp"
+mv -f "$tmp_bp" "$BUILDPACKS_JSON_FILE"
+
+tmp_spaces="$(mktemp "${CACHE_ROOT%/}/.spaces.json.tmp.XXXXXX")"
+fetch_all_pages_v2 "/v2/spaces" >"$tmp_spaces" || echo '{"resources":[]}' >"$tmp_spaces"
+mv -f "$tmp_spaces" "$SPACES_JSON_FILE"
+
+tmp_orgs="$(mktemp "${CACHE_ROOT%/}/.orgs.json.tmp.XXXXXX")"
+fetch_all_pages_v2 "/v2/organizations" >"$tmp_orgs" || echo '{"resources":[]}' >"$tmp_orgs"
+mv -f "$tmp_orgs" "$ORGS_JSON_FILE"
+
+tmp_stacks="$(mktemp "${CACHE_ROOT%/}/.stacks.json.tmp.XXXXXX")"
+fetch_all_pages_v2 "/v2/stacks" >"$tmp_stacks" || echo '{"resources":[]}' >"$tmp_stacks"
+mv -f "$tmp_stacks" "$STACKS_JSON_FILE"
+
 
 get_buildpack_filename() {
   local bp_key="$1" stack_name="${2:-}"
@@ -161,7 +205,7 @@ get_space_org_names_safe() {
 }
 
 # ---------------------------- header ------------------------------
-echo "Org_Name,Space_Name,Created_At,Updated_At,Name,GUID,Instances,Memory,Disk_Quota,Requested_Buildpack,Detected_Buildpack,Detected_Buildpack_GUID,Buildpack_Filename,Buildpack_Version,Runtime_Version,DropletSizeBytes,PackagesSizeBytes,HealthCheckType,App_State,Stack_Name,Services,Routes,Developers,Detected_Start_Command,Events"
+csv_row "Org_Name,Space_Name,Created_At,Updated_At,Name,GUID,Instances,Memory,Disk_Quota,Requested_Buildpack,Detected_Buildpack,Detected_Buildpack_GUID,Buildpack_Filename,Buildpack_Version,Runtime_Version,DropletSizeBytes,PackagesSizeBytes,HealthCheckType,App_State,Stack_Name,Services,Routes,Developers,Detected_Start_Command,Events"
 
 # ---------------------------- per app -----------------------------
 process_app() {
@@ -264,7 +308,7 @@ process_app() {
     events=$(jq -cr '.resources[]?' <<<"$events_json" | paste -sd ':#:' -)
   fi
 
-  echo "$org_name,$space_name,$created_at,$updated_at,$name,$app_guid,$instances,$memory,$disk_quota,$buildpack,$detected_buildpack,$detected_buildpack_guid,$buildpack_filename,$buildpack_version,$runtime_version,$droplet_size_bytes,$packages_size_bytes,$health_check,$app_state,$stack_name,$services,$routes,$dev_usernames,$detected_start_command,$events"
+  csv_row "$org_name,$space_name,$created_at,$updated_at,$name,$app_guid,$instances,$memory,$disk_quota,$buildpack,$detected_buildpack,$detected_buildpack_guid,$buildpack_filename,$buildpack_version,$runtime_version,$droplet_size_bytes,$packages_size_bytes,$health_check,$app_state,$stack_name,$services,$routes,$dev_usernames,$detected_start_command,$events"
 }
 
 export -f process_app fetch_all_pages_v2 fetch_all_pages_v3 get_buildpack_filename get_version_info get_stack_name_safe get_space_org_names_safe
