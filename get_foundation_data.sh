@@ -88,9 +88,13 @@ fetch_all_pages_v3() {
 # ----------------------------- cache root -----------------------------
 # Prefer to keep caches under the run's outputs/<platform>/cache so they
 # are per-run/per-platform and automatically collected by the orchestrator.
-ORCH_OUT_DIR="${CF_ORCH_OUT_DIR:-"$PWD/outputs/${CF_ORCH_PLATFORM:-default}"}"
-CACHE_ROOT="${CF_ORCH_CACHE_ROOT:-"$ORCH_OUT_DIR/cache"}"
-
+ORCH_OUT_DIR="${CF_ORCH_OUT_DIR:-"$PWD/outputs"}"
+if [[ -n "${CF_ORCH_CACHE_ROOT:-}" ]]; then
+  CACHE_ROOT="$CF_ORCH_CACHE_ROOT"
+else
+  foundation_key="$(printf '%s' "${CF_API:-noapi}" | tr -c 'A-Za-z0-9._-' '_')"
+  CACHE_ROOT="$ORCH_OUT_DIR/cache/$foundation_key"
+fi
 mkdir -p "$CACHE_ROOT"
 
 echo "Using cache root: $CACHE_ROOT" >&2
@@ -106,7 +110,9 @@ SPACES_JSON_FILE="$CACHE_ROOT/spaces.json"
 ORGS_JSON_FILE="$CACHE_ROOT/orgs.json"
 STACKS_JSON_FILE="$CACHE_ROOT/stacks.json"
 
-
+# Make these available to each spawned worker
+export ORCH_OUT_DIR CACHE_ROOT \
+       BUILDPACKS_JSON_FILE SPACES_JSON_FILE ORGS_JSON_FILE STACKS_JSON_FILE
 #---------------------------- preload caches -----------------------------
 # Use temp files + mv to avoid partial writes if interrupted
 tmp_bp="$(mktemp "${CACHE_ROOT%/}/.buildpacks.json.tmp.XXXXXX")"
@@ -128,22 +134,76 @@ mv -f "$tmp_stacks" "$STACKS_JSON_FILE"
 
 get_buildpack_filename() {
   local bp_key="$1" stack_name="${2:-}"
-  [[ -s "$BUILDPACKS_JSON_FILE" ]] || { echo ""; return; }
-  if [[ "$bp_key" =~ ^[0-9a-fA-F-]{36}$ ]]; then
-    jq -r --arg guid "$bp_key" \
-      '.resources[]? | select(.metadata.guid == $guid) | .entity.filename // empty' \
-      "$BUILDPACKS_JSON_FILE" | head -n 1
-  else
-    if [[ -z "$stack_name" || "$stack_name" == "null" ]]; then
-      jq -r --arg name "$bp_key" \
-        '.resources[]? | select(.entity.name == $name) | .entity.filename // empty' \
-        "$BUILDPACKS_JSON_FILE" | head -n 1
+  local out=""
+
+  # Prefer cache if present
+  if [[ -s "$BUILDPACKS_JSON_FILE" ]]; then
+    if [[ "$bp_key" =~ ^[0-9a-fA-F-]{36}$ ]]; then
+      out=$(
+        jq -r --arg guid "$bp_key" '
+          .resources[]?
+          | select(.metadata.guid == $guid)
+          | .entity.filename // empty
+        ' "$BUILDPACKS_JSON_FILE" | head -n1
+      )
     else
-      jq -r --arg name "$bp_key" \
-        '.resources[]? | select(.entity.name == $name) | .entity.filename // empty' \
-        "$BUILDPACKS_JSON_FILE" | grep -i "$stack_name" | head -n 1
+      if [[ -z "$stack_name" || "$stack_name" == "null" ]]; then
+        out=$(
+          jq -r --arg name "$bp_key" '
+            .resources[]?
+            | select(.entity.name == $name)
+            | .entity.filename // empty
+          ' "$BUILDPACKS_JSON_FILE" | head -n1
+        )
+      else
+        out=$(
+          jq -r --arg name "$bp_key" --arg stack "$stack_name" '
+            .resources[]?
+            | select(.entity.name == $name and ((.entity.stack // "") == $stack))
+            | .entity.filename // empty
+          ' "$BUILDPACKS_JSON_FILE" | head -n1
+        )
+        # If not stack-specific in cache, prefer a stackless variant as fallback
+        if [[ -z "$out" ]]; then
+          out=$(
+            jq -r --arg name "$bp_key" '
+              .resources[]?
+              | select(.entity.name == $name and ((.entity.stack // "") == ""))
+              | .entity.filename // empty
+            ' "$BUILDPACKS_JSON_FILE" | head -n1
+          )
+        fi
+      fi
     fi
   fi
+
+  # Fallback: query API directly if cache miss
+  if [[ -z "$out" ]]; then
+    if [[ "$bp_key" =~ ^[0-9a-fA-F-]{36}$ ]]; then
+      out=$(cf curl "/v2/buildpacks/$bp_key" 2>/dev/null | jq -r '.entity.filename // empty')
+    else
+      # v2 search by name; filter by stack when provided
+      local resp
+      resp=$(cf curl "/v2/buildpacks?q=name:${bp_key}&results-per-page=100" 2>/dev/null || echo '{}')
+      if [[ -z "$stack_name" || "$stack_name" == "null" ]]; then
+        out=$(jq -r '.resources[]? | .entity.filename // empty' <<<"$resp" | head -n1)
+      else
+        out=$(
+          jq -r --arg stack "$stack_name" '
+            .resources[]?
+            | select((.entity.stack // "") == $stack)
+            | .entity.filename // empty
+          ' <<<"$resp" | head -n1
+        )
+        # fallback to stackless match if none
+        if [[ -z "$out" ]]; then
+          out=$(jq -r '.resources[]? | select((.entity.stack // "") == "") | .entity.filename // empty' <<<"$resp" | head -n1)
+        fi
+      fi
+    fi
+  fi
+
+  printf '%s\n' "${out:-}"
 }
 
 get_version_info() {
