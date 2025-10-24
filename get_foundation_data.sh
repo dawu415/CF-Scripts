@@ -32,6 +32,7 @@ csv_row() {  # join fields with commas, quoting each
   done
   printf "\n"
 }
+export -f csv_row csv_q
 
 # --- v2 pagination: follow .next_url, merge resources (safe; uses jq -s) ---
 fetch_all_pages_v2() {
@@ -370,8 +371,7 @@ process_app() {
 
   csv_row "$org_name,$space_name,$created_at,$updated_at,$name,$app_guid,$instances,$memory,$disk_quota,$buildpack,$detected_buildpack,$detected_buildpack_guid,$buildpack_filename,$buildpack_version,$runtime_version,$droplet_size_bytes,$packages_size_bytes,$health_check,$app_state,$stack_name,$services,$routes,$dev_usernames,$detected_start_command,$events"
 }
-
-export -f process_app fetch_all_pages_v2 fetch_all_pages_v3 get_buildpack_filename get_version_info get_stack_name_safe get_space_org_names_safe
+export -f process_app fetch_all_pages_v2 fetch_all_pages_v3 get_buildpack_filename get_version_info get_stack_name_safe get_space_org_names_safe 
 
 # ---------------------------- driver ------------------------------
 # Pull the full apps catalog via robust v2 pagination to avoid relying on .total_pages
