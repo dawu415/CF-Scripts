@@ -425,6 +425,7 @@ export CF_ORCH_RUN_DIR='{{REMOTE_DIR}}'
 export CF_ORCH_PLATFORM='{{PLATFORM}}'
 export CF_ORCH_OUT_DIR='{{REMOTE_DIR}}/outputs/{{PLATFORM}}'
 export CF_ORCH_CACHE_ROOT="$CF_ORCH_OUT_DIR/cache"
+export CF_ORCH_DATA_OUT="$CF_ORCH_OUT_DIR/{{PLATFORM}}.csv"
 mkdir -p "$CF_ORCH_CACHE_ROOT"
 
 export CF_HOME='{{REMOTE_DIR}}/.cf/{{PLATFORM}}/{{CF_SESSION}}'
