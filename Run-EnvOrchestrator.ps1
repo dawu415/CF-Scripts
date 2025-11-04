@@ -406,10 +406,16 @@ function Get-RemoteScriptDetached {
 
   $cfSess = if ([string]::IsNullOrWhiteSpace($CfSession)) { "default" } else { $CfSession }
 
+  # Build the inner command to run on the remote host.  When the caller
+  # provides explicit commands, they are joined with && and executed.  In the
+  # default case (no explicit commands), we run the uploaded script (with its
+  # original filename) and pass the API as its argument.  This allows
+  # arbitrary scripts to be used as workers.  PlatformCommands can override
+  # this default when additional commands or arguments are needed.
   $cmdInner = if ($Commands -and $Commands.Count -gt 0) {
     ($Commands -join " && ")
   } else {
-    "./inf.sh '$Api'"
+    "./$($script:InfLeafName) '$Api'"
   }
 
 $tmpl = @'
@@ -430,7 +436,7 @@ mkdir -p "$CF_ORCH_CACHE_ROOT"
 
 export CF_HOME='{{REMOTE_DIR}}/.cf/{{PLATFORM}}/{{CF_SESSION}}'
 mkdir -p "$CF_HOME"
-chmod +x inf.sh cf || true
+chmod +x '{{INF_FILE}}' cf || true
 rm -f outputs/{{PLATFORM}}/pid outputs/{{PLATFORM}}/exit.code || true
 
 # Record session id for debugging/resume visibility
@@ -468,7 +474,8 @@ __RUN__
                 Replace('{{REMOTE_DIR}}', $RemoteRunDir).
                 Replace('{{PLATFORM}}', $PlatformName).
                 Replace('{{CMD_INNER}}', $cmdInner).
-                Replace('{{CF_SESSION}}', $cfSess) 
+                Replace('{{CF_SESSION}}', $cfSess).
+                Replace('{{INF_FILE}}', $script:InfLeafName)
 
   return $tmpl
 }
@@ -615,6 +622,12 @@ Assert-FileExists $LocalFiles.CfBinary   "LocalFiles.CfBinary"
 Assert-FileExists $LocalFiles.InfScript  "LocalFiles.InfScript"
 New-LocalDir $OutRoot
 
+  # Capture the base filename of the uploaded script so it can be referenced
+  # throughout the orchestrator without assuming it will be renamed.  This
+  # enables arbitrary script names to be uploaded and executed on remote hosts.
+  $script:InfLeafName = [IO.Path]::GetFileName($LocalFiles.InfScript)
+
+
 $remoteRunDirByEnv = @{}     # envName -> resolved run dir
 $pending = @()               # list of task records we’ll poll
 $overallStart = Get-Date
@@ -633,7 +646,7 @@ $work = foreach ($envCfg in $Environments) {
 
 function Assert-RemoteArtifacts {
   <#
-    Verifies that inf.sh exists, cf is executable, and ./cf actually runs.
+    Verifies that the uploaded script exists, cf is executable, and ./cf actually runs.
     Throws with rich diagnostics if anything is wrong.
   #>
   [CmdletBinding()]
@@ -646,18 +659,19 @@ function Assert-RemoteArtifacts {
   # Bash-safe single-quote escape for embedding paths inside single-quoted strings
   $rrdEsc = ($RemoteRunDir -replace "'", "'\''")
 
+  # Build the verification script dynamically to reference the uploaded script
   $verifyCmd = @"
 set -Eeuo pipefail
 cd '$rrdEsc' || exit 2
 
 # Ensure bits are set (idempotent)
 chmod +x cf 2>/dev/null || true
-chmod +x inf.sh 2>/dev/null || true
+chmod +x '$($script:InfLeafName)' 2>/dev/null || true
 
-# Structural checks
-[ -f inf.sh ] && [ -x cf ] || exit 3
+# Structural checks: script must exist and cf must be executable
+[ -f '$($script:InfLeafName)' ] && [ -x cf ] || exit 3
 
-# Prove it's runnable (catches noexec/ACL/loader issues)
+# Prove cf is runnable (catches noexec/ACL/loader issues)
 "./cf" --version >/dev/null 2>&1 || exit 4
 exit 0
 "@
@@ -676,13 +690,13 @@ echo '--- mount options for run dir ---'
 ( command -v findmnt >/dev/null 2>&1 && findmnt -no TARGET,OPTIONS --target . ) || ( mount | head -n 10 )
 
 echo '--- perms ---'
-ls -ld .; ls -l inf.sh cf 2>&1
+ls -ld .; ls -l '$($script:InfLeafName)' cf 2>&1
 
 echo '--- stat ---'
-( stat -c '%n %a %A %U:%G %s %F' inf.sh cf 2>/dev/null || stat -f '%N %p %Sp %Su:%Sg %z %HT' inf.sh cf 2>/dev/null ) || true
+( stat -c '%n %a %A %U:%G %s %F' '$($script:InfLeafName)' cf 2>/dev/null || stat -f '%N %p %Sp %Su:%Sg %z %HT' '$($script:InfLeafName)' cf 2>/dev/null ) || true
 
 echo '--- ACL (if any) ---'
-( getfacl -p inf.sh cf 2>/dev/null ) || true
+( getfacl -p '$($script:InfLeafName)' cf 2>/dev/null ) || true
 
 echo '--- try ./cf --version ---'
 "./cf" --version ; echo "EC=$?"
@@ -712,7 +726,40 @@ function Ensure-Remote-Basics {
   $rrdEsc  = _Esc $RemoteRunDir
   $leafEsc = _Esc $infLeafLocal
 
-  $fix = @'
+  # Decide whether to rename the uploaded script to inf.sh based on an
+  # environment-level override.  When SkipInfRename is true on the
+  # environment configuration, we will preserve the uploaded script name and
+  # skip the renaming logic entirely.  Otherwise, we unify on inf.sh so
+  # the default launch command works.
+  # Always skip renaming the uploaded script to inf.sh.  We preserve the
+  # original script name on the remote host so that arbitrary scripts can
+  # be executed without relying on a fixed name.
+  $skipInfRename = $true
+  if ($EnvCfg.PSObject.Properties.Name -contains 'SkipInfRename' -and $EnvCfg.SkipInfRename) {
+    $skipInfRename = $true
+  }
+
+  if ($skipInfRename) {
+    # Build a fix script that preserves the uploaded script name.  We still
+    # normalise the cf binary and mark both scripts as executable.
+    $fix = @"
+set -Eeuo pipefail
+cd '<<RRD>>'
+
+# Do not rename the uploaded script; just ensure cf is normalised and
+# executable bits are set.
+[ -f cf.exe ] && mv -f cf.exe cf
+
+chmod +x cf 2>/dev/null || true
+chmod +x '<<INF_LEAF>>' 2>/dev/null || true
+chmod +x inf.sh 2>/dev/null || true
+
+# Show what we have (helps when -TraceSSH is on)
+ls -l *.sh cf 2>/dev/null || true
+"@
+  } else {
+    # Build the default fix script that renames the uploaded script to inf.sh
+    $fix = @"
 set -Eeuo pipefail
 cd '<<RRD>>'
 
@@ -722,8 +769,8 @@ if [ ! -f inf.sh ]; then
     mv -f '<<INF_LEAF>>' inf.sh
   else
     # as a fallback: if exactly one *.sh exists, make it inf.sh
-    cnt=$(ls -1 *.sh 2>/dev/null | wc -l | tr -d ' ')
-    if [ "$cnt" = "1" ]; then mv -f $(ls -1 *.sh) inf.sh; fi
+    cnt=\$(ls -1 *.sh 2>/dev/null | wc -l | tr -d ' ')
+    if [ "\$cnt" = "1" ]; then mv -f \$(ls -1 *.sh) inf.sh; fi
   fi
 fi
 
@@ -732,12 +779,15 @@ fi
 
 # Ensure exec bits
 chmod +x cf 2>/dev/null || true
+chmod +x '<<INF_LEAF>>' 2>/dev/null || true
 chmod +x inf.sh 2>/dev/null || true
 
 # Show what we have (helps when -TraceSSH is on)
 ls -l inf.sh cf 2>/dev/null || true
-'@
+"@
+  }
 
+  # Inject remote dir and script names into the fix script
   $fix = $fix.Replace('<<RRD>>', $rrdEsc).Replace('<<INF_LEAF>>', $leafEsc)
 
   $post = Invoke-SSH -EnvCfg $EnvCfg -RemoteCommand $fix -HardTimeoutSec $SshHardTimeoutSec
