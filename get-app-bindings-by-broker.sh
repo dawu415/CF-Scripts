@@ -44,7 +44,8 @@ enc() {
   jq -rn --arg s "$1" '$s|@uri'
 }
 
-HEADER="broker_name,binding_type,service_offering_name,service_plan_name,service_instance_name,service_binding_guid,binding_name,app_name,app_guid,space_name,space_guid,org_name,org_guid,credential_uri,credentials_json"
+# NOTE: added service_instance_guid after service_instance_name
+HEADER="broker_name,binding_type,service_offering_name,service_plan_name,service_instance_name,service_instance_guid,service_binding_guid,binding_name,app_name,app_guid,space_name,space_guid,org_name,org_guid,credential_uri,credentials_json"
 
 csv_open() {
   if [[ -n "${CF_ORCH_DATA_OUT:-}" ]]; then
@@ -192,7 +193,7 @@ if (( ${#APP_GUIDS[@]} )); then
   apps="$(printf '%s\n' "${APP_GUIDS[@]}" | parallel_get_objs "/v3/apps")"
 fi
 
-# --- CHANGED: include spaces from both apps and instances so unbound instances get space/org info ---
+# spaces from both apps and instances (so unbound instances still resolve space/org)
 mapfile -t SPACE_GUIDS < <(
   {
     jq -r '.[].relationships.space.data.guid' <<<"$apps"
@@ -222,9 +223,9 @@ if (( ${#KEY_BINDING_GUIDS[@]} )); then
 fi
 
 offer_map="$(jq -c 'map({key:.guid, value:{name:.name}}) | from_entries' <<<"$offerings")"
-
-# --- CHANGED: instance map now also stores space_guid so we can resolve unbound instances ---
 plan_map="$(jq -c 'map({key:.guid, value:{name:.name, offering_guid:.relationships.service_offering.data.guid}}) | from_entries' <<<"$plans")"
+
+# instance map includes space_guid for unbound instances
 inst_map="$(jq -c 'map({key:.guid, value:{name:.name, plan_guid:.relationships.service_plan.data.guid, space_guid:.relationships.space.data.guid}}) | from_entries' <<<"$instances")"
 app_map="$(jq -c 'map({key:.guid, value:{name:.name, space_guid:.relationships.space.data.guid}}) | from_entries' <<<"$apps")"
 space_map="$(jq -c 'map({key:.guid, value:{name:.name, org_guid:.relationships.organization.data.guid}}) | from_entries' <<<"$spaces")"
@@ -241,12 +242,12 @@ org_file="$tmpdir/org.json"
 det_app_file="$tmpdir/app_details.json"
 det_key_file="$tmpdir/key_details.json"
 
-printf '%s' "$offer_map"     >"$offer_file"
-printf '%s' "$plan_map"      >"$plan_file"
-printf '%s' "$inst_map"      >"$inst_file"
-printf '%s' "$app_map"       >"$app_file"
-printf '%s' "$space_map"     >"$space_file"
-printf '%s' "$org_map"       >"$org_file"
+printf '%s' "$offer_map"      >"$offer_file"
+printf '%s' "$plan_map"       >"$plan_file"
+printf '%s' "$inst_map"       >"$inst_file"
+printf '%s' "$app_map"        >"$app_file"
+printf '%s' "$space_map"      >"$space_file"
+printf '%s' "$org_map"        >"$org_file"
 printf '%s' "$app_detail_map" >"$det_app_file"
 printf '%s' "$key_detail_map" >"$det_key_file"
 
@@ -284,6 +285,7 @@ def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
     safe_name($OFFER; $off_guid),
     safe_name($PLAN;  $plan_guid),
     safe_name($INST;  $si),
+    ($si // ""),
     $bid,
     $bname,
     safe_name($APP;   $appg),
@@ -317,6 +319,7 @@ def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
     safe_name($OFFER; $off_guid),
     safe_name($PLAN;  $plan_guid),
     safe_name($INST;  $si),
+    ($si // ""),
     $bid,
     $bname,
     "", "", "", "", "", "",
@@ -326,7 +329,7 @@ def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
 JQKEY
 )
 
-# NEW: emit rows for instances with no bindings (binding_type = "none")
+# Unbound instances: binding_type = "none", include service_instance_guid
 unbound_jq_script=$(cat <<'JQUNB'
 def safe_name(m; k): (m[0][k]? | objects | .name?) // "N/A";
 def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
@@ -351,6 +354,7 @@ def bound_si_guids:
     safe_name($OFFER; $off_guid),
     safe_name($PLAN;  $plan_guid),
     safe_name($INST;  $si),
+    ($si // ""),
     "",
     $bname,
     "",
