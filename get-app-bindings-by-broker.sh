@@ -3,7 +3,7 @@
 # cf-broker-bindings-with-creds-orch.sh
 #
 # This script wraps the original service binding inventory script so it can
-# participate nicely when launched by the Cloud Foundry environment
+# participate nicely when launched by the Cloud Foundry environment
 # orchestrator.  It honours the environment variables provided by the
 # orchestrator for CSV output and writes rows under a file lock when
 # CF_ORCH_DATA_OUT is set.  When no orchestrator is involved it
@@ -148,10 +148,6 @@ parallel_get_objs() {
 
 parallel_get_binding_details_map() {
   # Build a map of binding GUIDs to their detailed credential information.
-  # Instead of embedding a jq variable reference that may be expanded by the
-  # shell, we pass the GUID as an environment variable (GUID) into jq and
-  # construct a single-entry object using that env var as the key.  xargs
-  # passes each GUID as an argument to the bash script via $1.
   xargs -I% -P 16 bash -c '
     guid="$1"
     cf curl "/v3/service_credential_bindings/$guid/details" 2>/dev/null |
@@ -195,7 +191,15 @@ apps='[]'
 if (( ${#APP_GUIDS[@]} )); then
   apps="$(printf '%s\n' "${APP_GUIDS[@]}" | parallel_get_objs "/v3/apps")"
 fi
-mapfile -t SPACE_GUIDS < <(jq -r '.[].relationships.space.data.guid' <<<"$apps" | sort -u)
+
+# --- CHANGED: include spaces from both apps and instances so unbound instances get space/org info ---
+mapfile -t SPACE_GUIDS < <(
+  {
+    jq -r '.[].relationships.space.data.guid' <<<"$apps"
+    jq -r '.[].relationships.space.data.guid' <<<"$instances"
+  } | sort -u
+)
+
 spaces='[]'
 if (( ${#SPACE_GUIDS[@]} )); then
   spaces="$(printf '%s\n' "${SPACE_GUIDS[@]}" | parallel_get_objs "/v3/spaces")"
@@ -218,16 +222,15 @@ if (( ${#KEY_BINDING_GUIDS[@]} )); then
 fi
 
 offer_map="$(jq -c 'map({key:.guid, value:{name:.name}}) | from_entries' <<<"$offerings")"
+
+# --- CHANGED: instance map now also stores space_guid so we can resolve unbound instances ---
 plan_map="$(jq -c 'map({key:.guid, value:{name:.name, offering_guid:.relationships.service_offering.data.guid}}) | from_entries' <<<"$plans")"
-inst_map="$(jq -c 'map({key:.guid, value:{name:.name, plan_guid:.relationships.service_plan.data.guid}}) | from_entries' <<<"$instances")"
+inst_map="$(jq -c 'map({key:.guid, value:{name:.name, plan_guid:.relationships.service_plan.data.guid, space_guid:.relationships.space.data.guid}}) | from_entries' <<<"$instances")"
 app_map="$(jq -c 'map({key:.guid, value:{name:.name, space_guid:.relationships.space.data.guid}}) | from_entries' <<<"$apps")"
 space_map="$(jq -c 'map({key:.guid, value:{name:.name, org_guid:.relationships.organization.data.guid}}) | from_entries' <<<"$spaces")"
 org_map="$(jq -c 'map({key:.guid, value:{name:.name}}) | from_entries' <<<"$orgs")"
 
-# Persist large lookup maps to temporary files.  Passing these maps as
-# --argjson arguments to jq can exceed command-line length limits when
-# dealing with hundreds or thousands of entries.  Writing them to
-# temporary files and loading via --slurpfile avoids this issue.
+# Persist large lookup maps to temporary files.
 tmpdir="$(mktemp -d)"
 offer_file="$tmpdir/offer.json"
 plan_file="$tmpdir/plan.json"
@@ -238,14 +241,20 @@ org_file="$tmpdir/org.json"
 det_app_file="$tmpdir/app_details.json"
 det_key_file="$tmpdir/key_details.json"
 
-printf '%s' "$offer_map" >"$offer_file"
-printf '%s' "$plan_map"  >"$plan_file"
-printf '%s' "$inst_map"  >"$inst_file"
-printf '%s' "$app_map"   >"$app_file"
-printf '%s' "$space_map" >"$space_file"
-printf '%s' "$org_map"   >"$org_file"
+printf '%s' "$offer_map"     >"$offer_file"
+printf '%s' "$plan_map"      >"$plan_file"
+printf '%s' "$inst_map"      >"$inst_file"
+printf '%s' "$app_map"       >"$app_file"
+printf '%s' "$space_map"     >"$space_file"
+printf '%s' "$org_map"       >"$org_file"
 printf '%s' "$app_detail_map" >"$det_app_file"
 printf '%s' "$key_detail_map" >"$det_key_file"
+
+# Also persist bindings so we can compute unbound instances in jq
+app_bind_file="$tmpdir/app_bindings.json"
+key_bind_file="$tmpdir/key_bindings.json"
+printf '%s' "$app_bindings" >"$app_bind_file"
+printf '%s' "$key_bindings" >"$key_bind_file"
 
 # Ensure temporary directory is cleaned up when the script exits
 cleanup_tmp() {
@@ -317,13 +326,47 @@ def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
 JQKEY
 )
 
- # Use slurpfile to load large lookup maps and credential detail maps from
- # temporary files.  Passing large maps via --argjson can exceed the
- # command-line length limits on some systems when dealing with many
- # thousands of bindings.  A slurped file becomes an array with one
- # element containing the entire map; inside the jq script we refer to
- # m[0] to get the map object itself.
- jq -r \
+# NEW: emit rows for instances with no bindings (binding_type = "none")
+unbound_jq_script=$(cat <<'JQUNB'
+def safe_name(m; k): (m[0][k]? | objects | .name?) // "N/A";
+def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
+def bound_si_guids:
+  (( $APPB[0] // [] ) + ( $KEYB[0] // [] ))
+  | map(.relationships.service_instance.data.guid // empty)
+  | unique;
+
+(bound_si_guids) as $bound
+| .[]
+| . as $i
+| ($i.guid // "N/A") as $si
+| select( $bound | index($si) | not )
+| "none" as $btype
+| "" as $bname
+| (safe_val($INST; $si; "plan_guid"))            as $plan_guid
+| (safe_val($PLAN; $plan_guid; "offering_guid")) as $off_guid
+| (safe_val($INST; $si; "space_guid"))           as $space_guid
+| [
+    $BROKER,
+    $btype,
+    safe_name($OFFER; $off_guid),
+    safe_name($PLAN;  $plan_guid),
+    safe_name($INST;  $si),
+    "",
+    $bname,
+    "",
+    "",
+    safe_name($SPACE; $space_guid),
+    ($space_guid // ""),
+    safe_name($ORG;   (safe_val($SPACE; $space_guid; "org_guid"))),
+    (safe_val($SPACE; $space_guid; "org_guid") // ""),
+    "",
+    ""
+  ] | @csv
+JQUNB
+)
+
+# App bindings
+jq -r \
   --arg BROKER "$BROKER_NAME" \
   --slurpfile OFFER "$offer_file" \
   --slurpfile PLAN  "$plan_file" \
@@ -337,6 +380,7 @@ while IFS= read -r line; do
   csv_emit_raw "$line"
 done
 
+# Key bindings
 jq -r \
   --arg BROKER "$BROKER_NAME" \
   --slurpfile OFFER "$offer_file" \
@@ -344,6 +388,21 @@ jq -r \
   --slurpfile INST  "$inst_file" \
   --slurpfile DET   "$det_key_file" \
   "$key_jq_script" <<<"$key_bindings" |
+while IFS= read -r line; do
+  csv_emit_raw "$line"
+done
+
+# Unbound instances (no app/key bindings)
+jq -r \
+  --arg BROKER "$BROKER_NAME" \
+  --slurpfile OFFER "$offer_file" \
+  --slurpfile PLAN  "$plan_file" \
+  --slurpfile INST  "$inst_file" \
+  --slurpfile SPACE "$space_file" \
+  --slurpfile ORG   "$org_file" \
+  --slurpfile APPB  "$app_bind_file" \
+  --slurpfile KEYB  "$key_bind_file" \
+  "$unbound_jq_script" <<<"$instances" |
 while IFS= read -r line; do
   csv_emit_raw "$line"
 done
