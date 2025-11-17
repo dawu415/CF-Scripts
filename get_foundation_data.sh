@@ -367,7 +367,7 @@ fetch_all_pages_v3() {
 }
 
 # ----------------------------- Cache setup -----------------------------
-ORCH_OUT_DIR="${CF_ORCH_OUT_DIR:-"$PWD/outputs"}"
+ORCH_OUT_DIR="${CF_ORCH_OUT_DIR:-$PWD/outputs}"
 if [[ -n "${CF_ORCH_CACHE_ROOT:-}" ]]; then
   CACHE_ROOT="$CF_ORCH_CACHE_ROOT"
 else
@@ -692,7 +692,7 @@ process_app() {
   fi
 
   # ------------------------ java_runtime_data ------------------------
-  if [[ -n "$JAVA_RUNTIME_OUT" && ( "$grouped_buildpack" == "Java (Offline)" || "$grouped_buildpack" == "Java (Online)" ) ]]; then
+  if [[ -n "$JAVA_RUNTIME_OUT" && -n "$jre_version" && "$jre_version" != "Unknown" ]]; then
     csv_write_row "$JAVA_RUNTIME_OUT" \
       "$app_guid" "$name" "$org_name" "$space_name" \
       "$extracted_version" "$runtime_version" "$jre_version" \
