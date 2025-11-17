@@ -434,11 +434,20 @@ get_buildpack_filename() {
 get_version_info() {
   local app_guid="$1" detected_buildpack="$2" buildpack_filename="${3:-}"
   local env_data buildpack_version runtime_version
+  runtime_version=""
+
   env_data=$(cf curl "/v2/apps/${app_guid}/env" 2>/dev/null || echo '{}')
   buildpack_version=$(jq -r '.staging_env_json.BUILDPACK_VERSION // empty' <<<"$env_data")
 
   if [[ "$detected_buildpack" == *"java"* || "$detected_buildpack" == *"Java"* ]]; then
-    runtime_version=$(jq -r '.staging_env_json.JBP_CONFIG_OPEN_JDK_JRE // empty' <<<"$env_data" | grep -oE '[0-9]+' | head -1)
+    # Pull the JBP_CONFIG_OPEN_JDK_JRE and extract the first integer with bash regex.
+    local jre_cfg
+    jre_cfg=$(jq -r '.staging_env_json.JBP_CONFIG_OPEN_JDK_JRE // empty' <<<"$env_data")
+    if [[ "$jre_cfg" =~ ([0-9]+) ]]; then
+      runtime_version="${BASH_REMATCH[1]}"
+    else
+      runtime_version=""
+    fi
   elif [[ "$detected_buildpack" == *"node"* || "$detected_buildpack" == *"Node"* ]]; then
     runtime_version=$(jq -r '.environment_json.NODE_VERSION // empty' <<<"$env_data")
   elif [[ "$detected_buildpack" == *"python"* || "$detected_buildpack" == *"Python"* ]]; then
@@ -768,8 +777,17 @@ fi
 workers="${WORKERS:-6}"
 echo "Processing apps (workers: $workers)..." >&2
 if [[ "$workers" -gt 1 ]]; then
-  jq -c '.resources // [] | .[]' "$APPS_JSON_FILE" \
-    | xargs -P "$workers" -I {} bash -c 'process_app "$@"' _ '{}'
+  current=0
+
+  while IFS= read -r app; do
+    process_app "$app" &
+    (( current++ ))
+    if (( current >= max_jobs )); then
+      wait
+      current=0
+    fi
+  done < <(jq -c '.resources // [] | .[]' "$APPS_JSON_FILE")
+  wait
 else
   while IFS= read -r app; do
     process_app "$app"
