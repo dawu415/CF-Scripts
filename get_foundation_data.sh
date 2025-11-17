@@ -775,19 +775,46 @@ if ! jq -e . >/dev/null 2>&1 <"$APPS_JSON_FILE"; then
 fi
 
 workers="${WORKERS:-6}"
-echo "Processing apps (workers: $workers)..." >&2
-if [[ "$workers" -gt 1 ]]; then
-  current=0
 
+# Ensure workers is a sane positive integer
+if ! [[ "$workers" =~ ^[1-9][0-9]*$ ]]; then
+  workers=1
+fi
+
+echo "Processing apps (workers: $workers)..." >&2
+
+if (( workers > 1 )); then
+  current=0
+  overall_status=0
+
+  # Background job wrapper to capture individual failures without killing the whole script
+  process_app_wrapper() {
+    local app_json="$1"
+    if ! process_app "$app_json"; then
+      # record that at least one job failed
+      overall_status=1
+    fi
+  }
+
+  # Run in parallel, but temporarily relax `set -e` so a single failure
+  # doesn't abort the whole foundation immediately.
+  set +e
   while IFS= read -r app; do
-    process_app "$app" &
+    process_app_wrapper "$app" &
     (( current++ ))
-    if (( current >= max_jobs )); then
+    if (( current >= workers )); then
       wait
       current=0
     fi
   done < <(jq -c '.resources // [] | .[]' "$APPS_JSON_FILE")
   wait
+  set -e
+
+  if (( overall_status != 0 )); then
+    echo "WARNING: One or more app processing jobs failed on this foundation." >&2
+    # Optionally: exit 1 here if you *do* want to treat that as fatal.
+    # exit 1
+  fi
 else
   while IFS= read -r app; do
     process_app "$app"
