@@ -530,7 +530,7 @@ csv_write_header "$APP_DATA_OUT"        "${APP_HEADER[@]}"
 [[ -n "$DEVELOPER_DATA_OUT" ]]  && csv_write_header "$DEVELOPER_DATA_OUT"  "${DEVELOPER_HEADER[@]}"
 [[ -n "$JAVA_RUNTIME_OUT" ]]    && csv_write_header "$JAVA_RUNTIME_OUT"    "${JAVA_HEADER[@]}"
 [[ -n "$AUDIT_EVENTS_OUT" ]]    && csv_write_header "$AUDIT_EVENTS_OUT"    "${EVENTS_HEADER[@]}"
-[[ -n "$SERVICE_BINDINGS_OUT" ]]&& csv_write_header "$SERVICE_BINDINGS_OUT"${BINDINGS_HEADER[@]}"
+[[ -n "$SERVICE_BINDINGS_OUT" ]] && csv_write_header "$SERVICE_BINDINGS_OUT" "${BINDINGS_HEADER[@]}"
 
 # ----------------------------- Process app data -----------------------------
 declare -A SPACE_DEV_SEEN
