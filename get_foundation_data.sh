@@ -610,7 +610,8 @@ process_app() {
     fi
   fi
 
-  local grouped_buildpack; grouped_buildpack=$(simplify_buildpack_name "$lookup_val")
+  local grouped_buildpack
+  grouped_buildpack=$(simplify_buildpack_name "$lookup_val")
 
   local extracted_version=""
   if [[ -n "$buildpack_filename" && "$buildpack_filename" != "null" ]]; then
@@ -627,12 +628,13 @@ process_app() {
   [[ -n "$droplet_size_bytes" && "$droplet_size_bytes" =~ ^[0-9]+$ ]] && ((total_bytes += droplet_size_bytes))
   [[ -n "$packages_size_bytes" && "$packages_size_bytes" =~ ^[0-9]+$ ]] && ((total_bytes += packages_size_bytes))
   local est_mb=""
-  [[ $total_bytes -gt 0 ]] && est_mb=$(echo "scale=2; $total_bytes / 1048576" | bc 2>/dev/null || echo "")
+  [[ $total_bytes -gt 0 ]] && est_mb=$(awk -v b="$total_bytes" 'BEGIN { printf "%.2f", b / 1048576 }')
 
   local summary_json routes
   summary_json=$(cf curl "/v2/apps/${app_guid}/summary" 2>/dev/null || echo '{}')
   routes=$(jq -r '.routes // [] | .[] | (.host + "." + .domain.name)' <<<"$summary_json" | paste -sd ':' -)
 
+  # ------------------------ services & service_data ------------------------
   local -a services_list=()
   local svc service_guid service_type service_string label plan svc_name
   while IFS= read -r svc; do
@@ -665,6 +667,7 @@ process_app() {
     service_count=${#services_list[@]}
   fi
 
+  # ------------------------ developers & developer_space_data ------------------------
   local dev_usernames
   dev_usernames=$(cf curl "${space_url}/developers" 2>/dev/null \
     | jq -r '.resources // [] | .[] | .entity | select(.username != null) | .username' \
@@ -688,6 +691,7 @@ process_app() {
     done
   fi
 
+  # ------------------------ java_runtime_data ------------------------
   if [[ -n "$JAVA_RUNTIME_OUT" && ( "$grouped_buildpack" == "Java (Offline)" || "$grouped_buildpack" == "Java (Online)" ) ]]; then
     csv_write_row "$JAVA_RUNTIME_OUT" \
       "$app_guid" "$name" "$org_name" "$space_name" \
@@ -695,45 +699,43 @@ process_app() {
       "$FOUNDATION_SLUG" "$BATCH_ID"
   fi
 
+  # ------------------------ audit events (paginated) ------------------------
   local events=""
-  local events_json
+  local events_json="[]"
 
-  # Use v3 audit events with full pagination
-  events_json=$(fetch_all_pages_v3 "/v3/audit_events?target_guids=${app_guid}" 2>/dev/null || echo '[]')
+  events_json="$(fetch_all_pages_v3 "/v3/audit_events?target_guids=${app_guid}")"
 
   if [[ "$(jq 'length' <<<"$events_json")" -gt 0 ]]; then
     if [[ -n "$AUDIT_EVENTS_OUT" ]]; then
       while IFS= read -r event; do
         local event_type actor actor_type actor_name ts meta
-        event_type=$(jq -r '.type // ""'           <<<"$event")
-        actor=$(jq -r      '.actor.guid // ""'     <<<"$event")
-        actor_type=$(jq -r '.actor.type // ""'     <<<"$event")
-        actor_name=$(jq -r '.actor.name // ""'     <<<"$event")
-        ts=$(jq -r         '.created_at // ""'     <<<"$event")
-        meta=$(jq -c       '.data // {}'           <<<"$event")
+        event_type="$(jq -r '.type // ""'           <<<"$event")"
+        actor="$(jq -r      '.actor.guid // ""'     <<<"$event")"
+        actor_type="$(jq -r '.actor.type // ""'     <<<"$event")"
+        actor_name="$(jq -r '.actor.name // ""'     <<<"$event")"
+        ts="$(jq -r         '.created_at // ""'     <<<"$event")"
+        meta="$(jq -c       '.data // {}'           <<<"$event")"
 
         csv_write_row "$AUDIT_EVENTS_OUT" \
           "$app_guid" "$name" "$event_type" "$actor" "$actor_type" "$actor_name" \
           "$ts" "$meta" "$FOUNDATION_SLUG" "$BATCH_ID"
       done < <(jq -c '.[]' <<<"$events_json")
     fi
-
-    # Compact representation for the app_data "Events" column
-    events=$(jq -cr '.[]?' <<<"$events_json" | paste -sd ':#:' -)
-
+    events="$(jq -cr '.[]?' <<<"$events_json" | paste -sd ':#:' -)"
   else
-    # Fallback to old v2 events if v3 has nothing
-    local events_url; events_url=$(jq -r '.entity.events_url // empty' <<<"$app")
+    local events_url
+    events_url="$(jq -r '.entity.events_url // empty' <<<"$app")"
     if [[ -n "$events_url" ]]; then
-      events_json=$(fetch_all_pages_v2 "$events_url")
-      events=$(jq -cr '.resources[]?' <<<"$events_json" | paste -sd ':#:' -)
+      events_json="$(fetch_all_pages_v2 "$events_url")"
+      events="$(jq -cr '.resources[]?' <<<"$events_json" | paste -sd ':#:' -)"
     fi
   fi
 
-
+  # ------------------------ developer count ------------------------
   local dev_count=0
   [[ -n "$dev_usernames" ]] && dev_count=$(echo "$dev_usernames" | tr ':' '\n' | grep -v '^$' | wc -l | tr -d ' ')
 
+  # ------------------------ final app_data row ------------------------
   csv_write_row "$APP_DATA_OUT" \
     "$org_name" "$space_name" "$created_at" "$updated_at" "$name" "$app_guid" \
     "$instances" "$memory" "$disk_quota" \
