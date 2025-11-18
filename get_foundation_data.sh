@@ -104,18 +104,25 @@ JRE_MAP["4.32.1:8"]="1.8.0_265"; JRE_MAP["4.32.1:11"]="11.0.8_10"; JRE_MAP["4.32
 
 # Recent v4.58+
 for v in 4.58 4.59.0 4.60.0; do
+  # Versions prior to 4.64.0 only support Java 8, 11 and 17.  They do not
+  # include a Java 21 entry in the JRE lookup table.  See JRE.js for
+  # reference.
   JRE_MAP["$v:8"]="1.8.0_372"
   JRE_MAP["$v:11"]="11.0.19_7"
   JRE_MAP["$v:17"]="17.0.7_7"
 done
 
 for v in 4.61.0 4.61.1 4.62.0; do
+  # Versions 4.61.x only support Java 8, 11 and 17.  There is no Java 21
+  # entry for these buildpacks.
   JRE_MAP["$v:8"]="1.8.0_382"
   JRE_MAP["$v:11"]="11.0.20_8"
   JRE_MAP["$v:17"]="17.0.8_7"
 done
 
 for v in 4.63.0 4.63.1; do
+  # Versions 4.63.x only support Java 8, 11 and 17.  There is no Java 21
+  # entry for these buildpacks.
   JRE_MAP["$v:8"]="1.8.0_392"
   JRE_MAP["$v:11"]="11.0.21_10"
   JRE_MAP["$v:17"]="17.0.9_11"
@@ -156,6 +163,7 @@ for v in 4.74.0 4.75.0; do
   JRE_MAP["$v:21"]="21.0.5_11"
 done
 
+# v4.76.0, 4.77.0, 4.78.0 were never released or had critical bugs.
 for v in 4.79.0 4.80.0 4.81.0; do
   JRE_MAP["$v:8"]="1.8.0_442"
   JRE_MAP["$v:11"]="11.0.26_9"
@@ -208,8 +216,8 @@ get_jre_version() {
     if [[ "$key" == "${normalized}:"* || "$key" == "${bp_version}:"* ]]; then
       local curr="${key##*:}"
       if [[ "$curr" -gt "$highest_major" ]]; then
-      highest_major="$curr"
-      highest_jre="${JRE_MAP[$key]}"
+        highest_major="$curr"
+        highest_jre="${JRE_MAP[$key]}"
       fi
     fi
   done
@@ -242,8 +250,13 @@ csv_cell() {
   s="${s//$'\n'/ }"
   s="${s//$'\t'/ }"
   case "$s" in
-    *[\",]*|*" "*) s="${s//\"/\"\"}"; printf '"%s"' "$s" ;;
-    *)            printf '%s' "$s" ;;
+    *[\",]*|*" "*)
+      s="${s//\"/\"\"}"
+      printf '"%s"' "$s"
+      ;;
+    *)
+      printf '%s' "$s"
+      ;;
   esac
 }
 
@@ -251,7 +264,7 @@ csv_row() {
   local line="" sep="" a
   for a in "$@"; do
     line+="$sep$(csv_cell "$a")"
-    sep=","
+    sep=",";
   done
   printf '%s\n' "$line"
 }
@@ -307,7 +320,9 @@ simplify_buildpack_name() {
 extract_full_version() {
   local filename="$1"
   [[ -z "$filename" || "$filename" == "null" ]] && { echo ""; return; }
-  if [[ "$filename" =~ -v([0-9]+\.[0-9]+(\.[0-9]+)?([-+._A-Za-z0-9]+)?) ]]; then
+  # Extract a dotted numeric version after '-v', ignoring any trailing file extensions like .zip
+  # Match patterns like '-v4.70.0' or '-v4.8' but stop before non-numeric suffixes
+  if [[ "$filename" =~ -v([0-9]+(?:\.[0-9]+)+) ]]; then
     echo "${BASH_REMATCH[1]}"
   else
     echo ""
@@ -447,17 +462,17 @@ get_version_info() {
       # Fall back to JAVA_VERSION or similar
       jre_cfg=$(jq -r '.staging_env_json.JAVA_VERSION // .environment_json.JAVA_VERSION // empty' <<<"$env_data")
     fi
-    # Extract just the version string if the config is a JSON object
-    # e.g. '{ jre: { version: "17.+" }}' -> '17.+'
+    # Extract just the version string if the config appears to be a JSON object
+    # e.g. '{ "jre": { "version": "17.+" }}' -> '17.+'
     if [[ "$jre_cfg" =~ \{ ]]; then
-      # Use jq to extract the jre.version field, ignoring errors
-      local jre_json
-      jre_json=$(printf '%s' "$jre_cfg" | jq -r 'try .jre.version // empty' 2>/dev/null || true)
-      if [[ -n "$jre_json" ]]; then
-        runtime_version="$jre_json"
+      # Attempt to parse as JSON and extract .jre.version; if that fails, leave empty
+      local extracted=""
+      extracted=$(printf '%s' "$jre_cfg" | jq -r 'try .jre.version // empty' 2>/dev/null || true)
+      if [[ -n "$extracted" ]]; then
+        runtime_version="$extracted"
       else
-        # Fallback to raw config if not a JSON with jre.version
-        runtime_version="$jre_cfg"
+        # Not a standard JSON; fallback to first numeric pattern like '17.+' or '17'
+        runtime_version=$(echo "$jre_cfg" | grep -oE '[0-9]+(\.[0-9]+)?\+?' | head -n1 || true)
       fi
     else
       runtime_version="$jre_cfg"
@@ -652,6 +667,14 @@ process_app() {
     extracted_version=$(extract_full_version "$buildpack_filename")
   fi
   [[ -z "$extracted_version" && -n "$buildpack_version" ]] && extracted_version="$buildpack_version"
+  # Fallback: extract version directly from buildpack or detected buildpack names if still empty
+  if [[ -z "$extracted_version" ]]; then
+    if [[ "$buildpack" =~ ([0-9]+\.[0-9]+(\.[0-9]+)?) ]]; then
+      extracted_version="${BASH_REMATCH[1]}"
+    elif [[ "$detected_buildpack" =~ ([0-9]+\.[0-9]+(\.[0-9]+)?) ]]; then
+      extracted_version="${BASH_REMATCH[1]}"
+    fi
+  fi
 
   local jre_version=""
   # Compute JRE version for Java apps.  We consider any grouped buildpack containing
@@ -954,7 +977,7 @@ if [[ -n "$SERVICE_BINDINGS_OUT" ]]; then
 
   parallel_get_objs() {
     local base="$1"
-    xargs -I{} -P 16 bash -c 'cf curl "'"$base"'/{}" 2>/dev/null' \
+    xargs -I{} -P 16 bash -c 'cf curl "'$base'"/{} 2>/dev/null' \
       | jq -s '[.[] | select(type=="object" and .guid != null)]'
   }
 
@@ -1140,6 +1163,7 @@ JQUNB
     space_map="$(jq -c 'map({key:.guid, value:{name:.name, org_guid:.relationships.organization.data.guid}}) | from_entries' <<<"$spaces")"
     org_map="$(jq -c 'map({key:.guid, value:{name:.name}}) | from_entries' <<<"$orgs")"
 
+    # Temporary directory for passing data into jq (same as before)
     tmpdir="$(mktemp -d)"
     offer_file="$tmpdir/offer.json"
     plan_file="$tmpdir/plan.json"
