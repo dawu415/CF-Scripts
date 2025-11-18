@@ -25,11 +25,11 @@ export CF_COLOR=false CF_TRACE=false TERM=dumb
 stty -g >/dev/null 2>&1 || true
 IFS=$' \t\n'
 
-trap 'ec=$?; set +u;
+ORIGINAL_ERR_TRAP='ec=$?; set +u;
       ts=$(date "+%F %T" 2>/dev/null || printf N/A);
       src="${BASH_SOURCE[0]:-$0}"; fn="${FUNCNAME[0]:-main}";
       echo "[$ts] ERROR ${ec:-1} at ${src}:${LINENO}: ${fn}: ${BASH_COMMAND:-?}" >&2;
-      exit "${ec:-1}"' ERR
+      exit "${ec:-1}"'
 
 command -v cf    >/dev/null 2>&1 || { echo "cf CLI not found in PATH" >&2; exit 6; }
 command -v jq    >/dev/null 2>&1 || { echo "jq not found in PATH" >&2; exit 6; }
@@ -796,7 +796,7 @@ process_app_wrapper() {
       exit "$ec"
     }
 
-    trap 'err_local' ERR
+    trap "$ORIGINAL_ERR_TRAP" ERR
 
     process_app "$app_json"
   )
@@ -820,34 +820,38 @@ fi
 
 echo "Processing apps (workers: $workers)..." >&2
 
-# Temporarily disable global ERR trap and -e while we chew through apps.
-# Per-app errors are handled by process_app_wrapper's own subshell + trap.
+# Temporarily disable global ERR trap and -e while we process apps
 trap - ERR
 set +e
 
 if (( workers > 1 )); then
   current=0
-
+  declare -a pids=()
+  
   while IFS= read -r app; do
     process_app_wrapper "$app" &
-    (( current++ ))
-
+    pids+=($!)
+    ((++current))
+    
     if (( current >= workers )); then
-      wait
-      current=0
+      wait -n
+      ((--current))
     fi
   done < <(jq -c '.resources // [] | .[]' "$APPS_JSON_FILE")
-
-  wait
+  
+  # Critical: Wait for ALL jobs to complete
+  for pid in "${pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
 else
   while IFS= read -r app; do
     process_app_wrapper "$app"
   done < <(jq -c '.resources // [] | .[]' "$APPS_JSON_FILE")
 fi
 
-# Restore strict mode and global ERR trap for everything after this
+# Restore strict mode and global ERR trap
 set -e
-trap 'err_trap' ERR
+trap "$ORIGINAL_ERR_TRAP" ERR
 
 if (( overall_status != 0 )); then
   echo "WARNING: One or more apps failed to process on foundation ${FOUNDATION_SLUG}. See ERROR lines above for details." >&2
