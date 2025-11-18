@@ -15,7 +15,6 @@
 # Designed to work with Run-EnvOrchestrator.ps1. When CF_ORCH_DATA_MODE=multi,
 # CF_ORCH_DATA_OUT is treated as a *base path/directory* and multiple CSVs
 # are created beneath it.
-#
 
 set -Eeuo pipefail
 [ -n "${BASH_VERSION:-}" ] || exec /usr/bin/env bash "$0" "$@"
@@ -63,7 +62,7 @@ echo "Batch Id:      $BATCH_ID" >&2
 
 # ----------------------------- JRE Version Mapping -----------------------------
 # Ported from JRE.js (jreMap + getJRE) so we can compute JRE versions wholly
-# on the bash side. If you update JRE.js, mirror the changes here. :contentReference[oaicite:4]{index=4}
+# on the bash side. If you update JRE.js, mirror the changes here.
 
 declare -A JRE_MAP
 
@@ -560,8 +559,17 @@ process_app() {
   local dl pl droplet_size_bytes="" packages_size_bytes=""
   dl=$(cf curl "/v3/apps/${app_guid}/droplets" 2>/dev/null | jq -r '.resources // [] | .[0].links.download.href // empty' | sed 's|http[s]*://[^/]*||')
   pl=$(cf curl "/v3/apps/${app_guid}/packages" 2>/dev/null | jq -r '.resources // [] | .[0].links.download.href // empty' | sed 's|http[s]*://[^/]*||')
-  [[ -n "$dl" ]] && droplet_size_bytes=$(cf curl -X HEAD -v "$dl" 2>&1 | awk -F': ' '/Content-Length:/ {gsub(/\r/,"",$2); print $2; exit}')
-  [[ -n "$pl" ]] && packages_size_bytes=$(cf curl -X HEAD -v "$pl" 2>&1 | awk -F': ' '/Content-Length:/ {gsub(/\r/,"",$2); print $2; exit}')
+  [[ -n "$dl" ]] && droplet_size_bytes=$(
+    cf curl -X HEAD -v "$dl" 2>&1 \
+      | awk -F': ' '/Content-Length:/ {gsub(/\r/,"",$2); print $2; exit}' \
+    || true
+    )
+
+  [[ -n "$pl" ]] && packages_size_bytes=$(
+    cf curl -X HEAD -v "$pl" 2>&1 \
+      | awk -F': ' '/Content-Length:/ {gsub(/\r/,"",$2); print $2; exit}' \
+    || true
+    )
 
   local health_check app_state
   health_check=$(jq -r '.entity.health_check_type // empty' <<<"$app")
@@ -701,7 +709,8 @@ process_app() {
   fi
 
   # ------------------------ java_runtime_data ------------------------
-  if [[ -n "$JAVA_RUNTIME_OUT" && -n "$jre_version" && "$jre_version" != "Unknown" ]]; then
+  # Only write Java runtime data rows for Java apps; include Unknown values rather than skipping.
+  if [[ -n "$JAVA_RUNTIME_OUT" && -n "$jre_version" ]]; then
     csv_write_row "$JAVA_RUNTIME_OUT" \
       "$app_guid" "$name" "$org_name" "$space_name" \
       "$extracted_version" "$runtime_version" "$jre_version" \
@@ -810,7 +819,6 @@ process_app_wrapper() {
   return 0  # we don't propagate failure up; we just log & mark overall_status
 }
 
-
 workers="${WORKERS:-6}"
 
 # Ensure workers is a sane positive integer
@@ -892,7 +900,7 @@ if [[ -n "$SERVICE_BINDINGS_OUT" ]]; then
   fetch_with_param_chunks() {
     local base="$1" param="$2" size="$3" extra_q="$4"
     shift 4
-    extra_q="${extra_q#\?}"; extra_q="${extra_q#&}"
+    extra_q="${extra_q#?}"; extra_q="${extra_q#&}"
     local -a items=( "$@" )
     {
       local -a chunk=(); local g
