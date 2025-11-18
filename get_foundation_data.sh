@@ -208,8 +208,8 @@ get_jre_version() {
     if [[ "$key" == "${normalized}:"* || "$key" == "${bp_version}:"* ]]; then
       local curr="${key##*:}"
       if [[ "$curr" -gt "$highest_major" ]]; then
-        highest_major="$curr"
-        highest_jre="${JRE_MAP[$key]}"
+      highest_major="$curr"
+      highest_jre="${JRE_MAP[$key]}"
       fi
     fi
   done
@@ -242,13 +242,8 @@ csv_cell() {
   s="${s//$'\n'/ }"
   s="${s//$'\t'/ }"
   case "$s" in
-    *[\",]*|*" "*)
-      s="${s//\"/\"\"}"
-      printf '"%s"' "$s"
-      ;;
-    *)
-      printf '%s' "$s"
-      ;;
+    *[\",]*|*" "*) s="${s//\"/\"\"}"; printf '"%s"' "$s" ;;
+    *)            printf '%s' "$s" ;;
   esac
 }
 
@@ -438,19 +433,41 @@ get_version_info() {
   env_data=$(cf curl "/v2/apps/${app_guid}/env" 2>/dev/null || echo '{}')
   buildpack_version=$(jq -r '.staging_env_json.BUILDPACK_VERSION // empty' <<<"$env_data")
 
-  if [[ "$detected_buildpack" == *"java"* || "$detected_buildpack" == *"Java"* ]]; then
-    # Pull the JBP_CONFIG_OPEN_JDK_JRE and extract the first integer with bash regex.
-    local jre_cfg
-    jre_cfg=$(jq -r '.staging_env_json.JBP_CONFIG_OPEN_JDK_JRE // empty' <<<"$env_data")
-    if [[ "$jre_cfg" =~ ([0-9]+) ]]; then
-      runtime_version="${BASH_REMATCH[1]}"
-    else
-      runtime_version=""
+  # Determine runtime_version based on language.  For Java, look at both
+  # staging_env_json and environment_json JBP_CONFIG_OPEN_JDK_JRE.  Fall back
+  # to JAVA_VERSION if present.  For other languages, use their respective
+  # environment variables.  We intentionally preserve the original runtime
+  # string (e.g. "17.+") rather than collapsing to just the digits here.  The
+  # get_jre_version() function will extract the major version as needed.
+  if [[ "$detected_buildpack" =~ [Jj]ava ]]; then
+    # Try to find a JRE config in staging or environment JSON
+    local jre_cfg=""
+    jre_cfg=$(jq -r '.staging_env_json.JBP_CONFIG_OPEN_JDK_JRE // .environment_json.JBP_CONFIG_OPEN_JDK_JRE // empty' <<<"$env_data")
+    if [[ -z "$jre_cfg" || "$jre_cfg" == "null" ]]; then
+      # Fall back to JAVA_VERSION or similar
+      jre_cfg=$(jq -r '.staging_env_json.JAVA_VERSION // .environment_json.JAVA_VERSION // empty' <<<"$env_data")
     fi
-  elif [[ "$detected_buildpack" == *"node"* || "$detected_buildpack" == *"Node"* ]]; then
+    # Extract just the version string if the config is a JSON object
+    # e.g. '{ jre: { version: "17.+" }}' -> '17.+'
+    if [[ "$jre_cfg" =~ \{ ]]; then
+      # Use jq to extract the jre.version field, ignoring errors
+      local jre_json
+      jre_json=$(printf '%s' "$jre_cfg" | jq -r 'try .jre.version // empty' 2>/dev/null || true)
+      if [[ -n "$jre_json" ]]; then
+        runtime_version="$jre_json"
+      else
+        # Fallback to raw config if not a JSON with jre.version
+        runtime_version="$jre_cfg"
+      fi
+    else
+      runtime_version="$jre_cfg"
+    fi
+  elif [[ "$detected_buildpack" =~ [Nn]ode ]]; then
     runtime_version=$(jq -r '.environment_json.NODE_VERSION // empty' <<<"$env_data")
-  elif [[ "$detected_buildpack" == *"python"* || "$detected_buildpack" == *"Python"* ]]; then
+  elif [[ "$detected_buildpack" =~ [Pp]ython ]]; then
     runtime_version=$(jq -r '.environment_json.PYTHON_VERSION // empty' <<<"$env_data")
+  else
+    runtime_version=""
   fi
 
   [[ -z "$buildpack_version" || "$buildpack_version" == "null" ]] && buildpack_version=""
@@ -637,7 +654,11 @@ process_app() {
   [[ -z "$extracted_version" && -n "$buildpack_version" ]] && extracted_version="$buildpack_version"
 
   local jre_version=""
-  if [[ "$grouped_buildpack" == "Java (Offline)" || "$grouped_buildpack" == "Java (Online)" ]]; then
+  # Compute JRE version for Java apps.  We consider any grouped buildpack containing
+  # the substring "java" (case-insensitive) to be a Java application.  If a
+  # runtime version is provided, it will be used to select the corresponding JRE
+  # version; otherwise the highest available JRE for the buildpack will be returned.
+  if [[ "$grouped_buildpack" =~ [Jj]ava ]]; then
     jre_version=$(get_jre_version "$extracted_version" "$runtime_version")
   fi
 
