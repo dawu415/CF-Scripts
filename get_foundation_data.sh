@@ -925,7 +925,8 @@ if [[ -n "$SERVICE_BINDINGS_OUT" ]]; then
         fi
         local resp
         resp="$(cf curl "$path" 2>/dev/null || echo '{}')"
-        jq -rc '.resources[]' <<<"$resp"
+        # Output each resource; if .resources is null, substitute an empty array
+        jq -rc '.resources // [] | .[]' <<<"$resp"
         local next
         next="$(jq -r '.pagination.next.href // ""' <<<"$resp")"
         if [[ -n "$next" ]]; then
@@ -977,7 +978,9 @@ if [[ -n "$SERVICE_BINDINGS_OUT" ]]; then
 
   parallel_get_objs() {
     local base="$1"
-    xargs -I{} -P 16 bash -c 'cf curl "'$base'"/{} 2>/dev/null' \
+    # Use xargs to fetch objects in parallel.  Pass the base URL as the first argument to the subshell
+    # to avoid quoting issues.  Each {} corresponds to a GUID appended to the base.
+    xargs -I{} -P 16 bash -c 'cf curl "$0/{}" 2>/dev/null' "$base" \
       | jq -s '[.[] | select(type=="object" and .guid != null)]'
   }
 
