@@ -326,6 +326,7 @@ extract_full_version() {
   #                  java-buildpack-v4.9.zip    -> 4.9
   #                  java-buildpack-v4.64.0-alpha -> 4.64.0-alpha
   #                  java-buildpack-v4.66.0+build -> 4.66.0+build
+  # The plus sign must be escaped in bash regex to match a literal plus.  Without escaping, it becomes a quantifier and causes the entire pattern to fail.
   if [[ "$filename" =~ -v([0-9]+\.[0-9]+(?:\.[0-9]+)?(?:-[[:alnum:]._-]+)?(?:\+[[:alnum:]._-]+)?) ]]; then
     echo "${BASH_REMATCH[1]}"
   else
@@ -646,6 +647,8 @@ process_app() {
   fi
 
   local buildpack_version runtime_version
+  # Retrieve any explicit buildpack and runtime versions from the app's staging/env metadata.
+  # get_version_info echoes two fields separated by a pipe: BUILD PACK VERSION and runtime preference.
   IFS='|' read -r buildpack_version runtime_version <<<"$(get_version_info "$app_guid" "$detected_buildpack" "$buildpack_filename")"
 
   local auto_state="NotFound"
@@ -688,6 +691,43 @@ process_app() {
       extracted_version="${BASH_REMATCH[1]}"
     elif [[ "$detected_buildpack" =~ ([0-9]+\.[0-9]+(\.[0-9]+)?) ]]; then
       extracted_version="${BASH_REMATCH[1]}"
+    fi
+  fi
+
+  # ---------------------------------------------------------------------
+  # If get_version_info did not return a buildpack version but we have an
+  # extracted version from the buildpack filename or name, propagate that
+  # into buildpack_version.  This ensures that buildpack_version (the
+  # variable used in the final CSV) is never blank when a version is
+  # discoverable via other means.  Without this, java_runtime_data.csv may
+  # contain blank Buildpack_Version values even though the buildpack
+  # filename includes a version string.
+  if [[ -z "$buildpack_version" && -n "$extracted_version" ]]; then
+    buildpack_version="$extracted_version"
+  fi
+
+  # In some environments the runtime_version may be absent or blank even for
+  # Java apps.  Try to extract a runtime preference from the app's
+  # buildpack or detected buildpack strings if the version appears there.
+  # For example, a buildpack string like "java-buildpack-v4.70.0#17" may
+  # contain a Java version preference after a hash or at the end.  If
+  # runtime_version is blank and we can find a trailing numeric or
+  # numeric-plus pattern, use it as a fallback runtime preference.
+  if [[ -z "$runtime_version" ]]; then
+    # Look for patterns like '#17', '-17', '_17' or '.17' at the end of the
+    # buildpack or detected buildpack strings.  Also match '17.+' or
+    # '17.+', capturing the leading digits and optional plus.
+    local maybe_ver
+    maybe_ver=""
+    # search buildpack string
+    if [[ "$buildpack" =~ ([0-9]+(\.[0-9]+)?\+?) ]]; then
+      maybe_ver="${BASH_REMATCH[1]}"
+    elif [[ "$detected_buildpack" =~ ([0-9]+(\.[0-9]+)?\+?) ]]; then
+      maybe_ver="${BASH_REMATCH[1]}"
+    fi
+    # Use the fallback if found
+    if [[ -n "$maybe_ver" ]]; then
+      runtime_version="$maybe_ver"
     fi
   fi
 
