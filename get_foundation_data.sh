@@ -743,10 +743,12 @@ process_app() {
   if [[ -z "$bp_version_field" ]]; then
     bp_version_field="Unknown"
   fi
+  # Preserve the original runtime version (which may be blank) for the
+  # java_runtime_data.csv output.  Do not replace a blank runtime
+  # preference with "Unknown" here; leaving it blank indicates the
+  # developer did not specify a runtime version.  We still keep
+  # runtime_version for computing the JRE lookup.
   local runtime_version_field="$runtime_version"
-  if [[ -z "$runtime_version_field" ]]; then
-    runtime_version_field="Unknown"
-  fi
 
   local jre_version=""
   # Compute JRE version for Java apps.  We consider any grouped buildpack containing
@@ -830,8 +832,9 @@ process_app() {
   if [[ -n "$JAVA_RUNTIME_OUT" && "$grouped_buildpack" =~ [Jj]ava ]]; then
     local bp_ver_out="$bp_version_field"
     [[ -z "$bp_ver_out" ]] && bp_ver_out="Unknown"
+    # For the runtime version column, leave it blank if the developer did not
+    # specify one.  We do not fill in "Unknown" here.
     local rt_ver_out="$runtime_version_field"
-    [[ -z "$rt_ver_out" ]] && rt_ver_out="Unknown"
     local jr_ver_out="$jre_version"
     [[ -z "$jr_ver_out" ]] && jr_ver_out="Unknown"
     csv_write_row "$JAVA_RUNTIME_OUT" \
