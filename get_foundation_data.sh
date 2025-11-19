@@ -204,19 +204,29 @@ get_jre_version() {
     fi
   fi
 
-  if [[ -n "$major" ]]; then
-    local key="${normalized}:${major}"
-    if [[ -n "${JRE_MAP[$key]:-}" ]]; then
-      echo "${JRE_MAP[$key]}"
-      return
-    fi
-    key="${bp_version}:${major}"
-    if [[ -n "${JRE_MAP[$key]:-}" ]]; then
-      echo "${JRE_MAP[$key]}"
-      return
-    fi
+  # When no valid major is extracted from the runtime preference, default to Java 8.
+  # This aligns with the platform behaviour where Java 8 is chosen when the
+  # developer does not specify a runtime or specifies an invalid one.
+  if [[ -z "$major" ]]; then
+    major="8"
   fi
 
+  # Attempt to look up an exact mapping for the normalized or full buildpack version
+  # combined with the chosen major.  Prefer the normalized version (strip trailing .0)
+  local lookup_key
+  lookup_key="${normalized}:${major}"
+  if [[ -n "${JRE_MAP[$lookup_key]:-}" ]]; then
+    echo "${JRE_MAP[$lookup_key]}"
+    return
+  fi
+  lookup_key="${bp_version}:${major}"
+  if [[ -n "${JRE_MAP[$lookup_key]:-}" ]]; then
+    echo "${JRE_MAP[$lookup_key]}"
+    return
+  fi
+
+  # If no direct mapping exists (very unlikely), fall back to the highest
+  # defined major for this buildpack version.
   local highest_major=0
   local highest_jre=""
   local key
