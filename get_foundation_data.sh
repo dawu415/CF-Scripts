@@ -1069,18 +1069,23 @@ if [[ -n "$SERVICE_BINDINGS_OUT" ]]; then
 
   parallel_get_objs() {
     local base="$1"
-    # Use xargs to fetch objects in parallel.  Pass the base URL as the first argument to the subshell
-    # to avoid quoting issues.  Each {} corresponds to a GUID appended to the base.
-    xargs -I{} -P 16 bash -c 'cf curl "$0/{}" 2>/dev/null' "$base" \
+    # Fetch each object in parallel.  We pass the base URL via an environment variable
+    # to the subshell to avoid referencing $0 (which refers to the bash executable).
+    # Within the subshell, $BASE holds the base path and {} is replaced with the GUID.
+    env BASE="$base" xargs -I{} -P 16 bash -c 'cf curl "$BASE/{}" 2>/dev/null' \
       | jq -s '[.[] | select(type=="object" and .guid != null)]'
   }
 
   parallel_get_binding_details_map() {
-    xargs -I% -P 16 bash -c '
-      guid="$1"
+    # Build a JSON object mapping each GUID to its details.  We avoid using
+    # positional parameters because xargs passes the replacement as $0 by
+    # default.  Instead, we assign the GUID directly within the subshell
+    # and use jq to construct an object keyed by the GUID.
+    xargs -I{} -P 16 bash -c '
+      guid="{}"
       cf curl "/v3/service_credential_bindings/$guid/details" 2>/dev/null |
-      GUID="$guid" jq -c "{ (env.GUID): . }"
-    ' _ % | jq -s 'add'
+      jq -c --arg g "$guid" "{ ($g): . }"
+    ' | jq -s 'add'
   }
 
   app_jq_script=$(cat <<'JQAPP'
