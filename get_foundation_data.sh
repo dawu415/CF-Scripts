@@ -491,17 +491,17 @@ get_version_info() {
   if [[ "$detected_buildpack" =~ [Jj]ava ]]; then
     # Try to find a JRE config in staging or environment JSON
     local jre_cfg=""
-    jre_cfg=$(jq -r '.staging_env_json.JBP_CONFIG_OPEN_JDK_JRE // .environment_json.JBP_CONFIG_OPEN_JDK_JRE // empty' <<<"$env_data")
+    jre_cfg=$(jq -r '.environment_json.JBP_CONFIG_OPEN_JDK_JRE // .staging_env_json.JBP_CONFIG_OPEN_JDK_JRE // empty' <<<"$env_data")
     if [[ -z "$jre_cfg" || "$jre_cfg" == "null" ]]; then
       # Fall back to JAVA_VERSION or similar
-      jre_cfg=$(jq -r '.staging_env_json.JAVA_VERSION // .environment_json.JAVA_VERSION // empty' <<<"$env_data")
+      jre_cfg=$(jq -r '.environment_json.JAVA_VERSION // .staging_env_json.JAVA_VERSION // empty' <<<"$env_data")
     fi
     # Extract just the version string if the config appears to be a JSON object
     # e.g. '{ "jre": { "version": "17.+" }}' -> '17.+'
     if [[ "$jre_cfg" =~ \{ ]]; then
       # Attempt to parse as JSON and extract .jre.version; if that fails, leave empty
       local extracted=""
-      extracted=$(printf '%s' "$jre_cfg" | jq -r 'try .jre.version // empty' 2>/dev/null || true)
+      extracted=$(printf '%s' "$jre_cfg" | sed 's/\([a-zA-Z_][a-zA-Z0-9_]*\):/"\1":/g' | sed 's/: \([0-9][^,} ]*\)/: "\1"/g' | jq -r 'try .jre.version // empty' 2>/dev/null || true)
       if [[ -n "$extracted" ]]; then
         runtime_version="$extracted"
       else
