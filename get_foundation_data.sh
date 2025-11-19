@@ -320,12 +320,19 @@ simplify_buildpack_name() {
 extract_full_version() {
   local filename="$1"
   [[ -z "$filename" || "$filename" == "null" ]] && { echo ""; return; }
-  # Extract a dotted numeric version after '-v', ignoring any trailing file extensions like .zip
-  # Match patterns like '-v4.70.0' or '-v4.8' but stop before non-numeric suffixes
-  if [[ "$filename" =~ -v([0-9]+(?:\.[0-9]+)+) ]]; then
+  # Extract the semantic version portion of a buildpack filename following the JavaScript logic in Utilities.js.
+  # It looks for '-vX.Y' with an optional third component and optional pre-release/build suffixes.
+  # Example matches: java-buildpack-v4.70.0.zip -> 4.70.0
+  #                  java-buildpack-v4.9.zip    -> 4.9
+  #                  java-buildpack-v4.64.0-alpha -> 4.64.0-alpha
+  #                  java-buildpack-v4.66.0+build -> 4.66.0+build
+  if [[ "$filename" =~ -v([0-9]+\.[0-9]+(?:\.[0-9]+)?(?:-[[:alnum:]._-]+)?(?:\+[[:alnum:]._-]+)?) ]]; then
     echo "${BASH_REMATCH[1]}"
   else
-    echo ""
+    # Fallback: search for the first dotted numeric pattern like 4.70.0 or 4.58 in the filename
+    local fallback
+    fallback=$(echo "$filename" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1 || true)
+    echo "$fallback"
   fi
 }
 
@@ -436,6 +443,14 @@ get_buildpack_filename() {
   fi
   if [[ -z "$out" && "$bp_key" =~ ^[0-9a-fA-F-]{36}$ ]]; then
     out=$(cf curl "/v2/buildpacks/$bp_key" 2>/dev/null | jq -r '.entity.filename // empty')
+  fi
+
+  # If still not found and bp_key is a name rather than a GUID, attempt a remote lookup by name.
+  # Some buildpacks may not be present in the cached buildpacks.json; query the API directly.
+  if [[ -z "$out" && -n "$bp_key" && ! "$bp_key" =~ ^[0-9a-fA-F-]{36}$ ]]; then
+    local resp
+    resp=$(cf curl "/v2/buildpacks?q=name:${bp_key}" 2>/dev/null || echo '{}')
+    out=$(printf '%s' "$resp" | jq -r '.resources[0].entity.filename // empty')
   fi
   printf '%s' "$out"
 }
@@ -676,6 +691,23 @@ process_app() {
     fi
   fi
 
+  # ---------------------------------------------------------------
+  # At this point, extracted_version holds the buildpack version, and
+  # runtime_version holds the version preference (e.g. "17.+").  In
+  # some environments these may remain empty.  To ensure the
+  # java_runtime_data.csv always contains a non-empty Buildpack_Version
+  # and Runtime_Version field, set them to "Unknown" if missing.  Use
+  # temporary variables for output so as not to interfere with
+  # subsequent logic (e.g. computing jre_version).
+  local bp_version_field="$extracted_version"
+  if [[ -z "$bp_version_field" ]]; then
+    bp_version_field="Unknown"
+  fi
+  local runtime_version_field="$runtime_version"
+  if [[ -z "$runtime_version_field" ]]; then
+    runtime_version_field="Unknown"
+  fi
+
   local jre_version=""
   # Compute JRE version for Java apps.  We consider any grouped buildpack containing
   # the substring "java" (case-insensitive) to be a Java application.  If a
@@ -753,11 +785,18 @@ process_app() {
   fi
 
   # ------------------------ java_runtime_data ------------------------
-  # Only write Java runtime data rows for Java apps; include Unknown values rather than skipping.
-  if [[ -n "$JAVA_RUNTIME_OUT" && -n "$jre_version" ]]; then
+  # Always write a Java runtime data row for apps identified as using a Java buildpack.
+  # Use fallback values of "Unknown" for missing buildpack or runtime version info.
+  if [[ -n "$JAVA_RUNTIME_OUT" && "$grouped_buildpack" =~ [Jj]ava ]]; then
+    local bp_ver_out="$bp_version_field"
+    [[ -z "$bp_ver_out" ]] && bp_ver_out="Unknown"
+    local rt_ver_out="$runtime_version_field"
+    [[ -z "$rt_ver_out" ]] && rt_ver_out="Unknown"
+    local jr_ver_out="$jre_version"
+    [[ -z "$jr_ver_out" ]] && jr_ver_out="Unknown"
     csv_write_row "$JAVA_RUNTIME_OUT" \
       "$app_guid" "$name" "$org_name" "$space_name" \
-      "$extracted_version" "$runtime_version" "$jre_version" \
+      "$bp_ver_out" "$rt_ver_out" "$jr_ver_out" \
       "$FOUNDATION_SLUG" "$BATCH_ID"
   fi
 
