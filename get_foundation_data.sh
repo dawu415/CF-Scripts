@@ -54,7 +54,11 @@ BATCH_ID="${BATCH_ID:-$(date +%Y%m%d_%H%M%S)}"
 ENV_LOCATION="${ENV_LOCATION:-unknown}"
 ENV_TYPE="${ENV_TYPE:-unknown}"
 ENV_DATACENTER="${ENV_DATACENTER:-unknown}"
-FOUNDATION_SLUG="${FOUNDATION_SLUG:-$FOUNDATION_KEY}"
+# When an orchestrator provides CF_ORCH_PLATFORM, prefer that value as the
+# foundation slug.  Otherwise, fall back to any pre-set FOUNDATION_SLUG and
+# ultimately the FOUNDATION_KEY derived from the API host.  This avoids
+# defaulting to the system slug when a platform identifier is available.
+FOUNDATION_SLUG="${CF_ORCH_PLATFORM:-${FOUNDATION_SLUG:-$FOUNDATION_KEY}}"
 
 echo "Foundation key: $FOUNDATION_KEY" >&2
 echo "Environment:   $ENV_LOCATION / $ENV_TYPE / $ENV_DATACENTER" >&2
@@ -191,7 +195,11 @@ get_jre_version() {
 
   local major=""
   if [[ -n "$runtime_pref" && "$runtime_pref" != "null" ]]; then
-    if [[ "$runtime_pref" =~ ([0-9]+) ]]; then
+    # If the preference is in the form 1.x (e.g. 1.8) then the effective
+    # major version is x.  Otherwise extract the leading numeric portion.
+    if [[ "$runtime_pref" =~ ^1\.([0-9]+) ]]; then
+      major="${BASH_REMATCH[1]}"
+    elif [[ "$runtime_pref" =~ ([0-9]+) ]]; then
       major="${BASH_REMATCH[1]}"
     fi
   fi
@@ -543,17 +551,16 @@ APP_HEADER=(
   "Requested_Buildpack" "Detected_Buildpack" "Detected_Buildpack_GUID"
   "Buildpack_Filename" "Buildpack_Version" "Runtime_Version"
   "DropletSizeBytes" "PackagesSizeBytes" "HealthCheckType" "App_State" "Stack_Name"
-  "Services" "Routes" "Developers" "Detected_Start_Command" "Events"
+  "Services" "Routes" "Developers" "Detected_Start_Command"
   "Stable_Key" "Foundation_Slug" "Env_Location" "Env_Type" "Env_Datacenter"
   "Buildpack_AutoDetectState" "Grouped_Buildpack"
-  "Estimated_Size_MegaBytes" "ExtractedBuildpack_FileVersions" "JRE_Version"
-  "Developer_Count" "Service_Count" "Batch_Id"
+  "Estimated_Size_Bytes" "Developer_Count" "Service_Count" "Batch_Id"
 )
 
 SERVICE_HEADER=(
   "Stable_Key" "Foundation_Slug" "App_GUID" "Org_Name" "Space_Name"
   "Env_Location" "Env_Type" "Env_Datacenter"
-  "Service_GUID" "Service_Type" "Service_Plan" "Batch_Id"
+  "Service_GUID" "Service_Type" "Service_Plan" "Service_Name" "Batch_Id"
 )
 
 DEVELOPER_HEADER=(
@@ -695,14 +702,13 @@ process_app() {
   fi
 
   # ---------------------------------------------------------------------
-  # If get_version_info did not return a buildpack version but we have an
-  # extracted version from the buildpack filename or name, propagate that
-  # into buildpack_version.  This ensures that buildpack_version (the
-  # variable used in the final CSV) is never blank when a version is
-  # discoverable via other means.  Without this, java_runtime_data.csv may
-  # contain blank Buildpack_Version values even though the buildpack
-  # filename includes a version string.
-  if [[ -z "$buildpack_version" && -n "$extracted_version" ]]; then
+  # Prefer the extracted version from the buildpack filename or name over
+  # the value obtained from BUILDPACK_VERSION in the app's staging env.
+  # The JSON environment value is often a bare number (e.g. 4.20 becomes
+  # 4.2) which causes truncation of trailing zeros.  To avoid this
+  # ambiguity, we always overwrite buildpack_version with the more
+  # accurate extracted_version when it is available.
+  if [[ -n "$extracted_version" ]]; then
     buildpack_version="$extracted_version"
   fi
 
@@ -762,8 +768,10 @@ process_app() {
   local total_bytes=0
   [[ -n "$droplet_size_bytes" && "$droplet_size_bytes" =~ ^[0-9]+$ ]] && ((total_bytes += droplet_size_bytes))
   [[ -n "$packages_size_bytes" && "$packages_size_bytes" =~ ^[0-9]+$ ]] && ((total_bytes += packages_size_bytes))
-  local est_mb=""
-  [[ $total_bytes -gt 0 ]] && est_mb=$(awk -v b="$total_bytes" 'BEGIN { printf "%.2f", b / 1048576 }')
+  # We report total package/droplet size in raw bytes rather than converting
+  # to megabytes.  The user prefers byte units.
+  local est_bytes=""
+  [[ $total_bytes -gt 0 ]] && est_bytes="$total_bytes"
 
   local summary_json routes
   summary_json=$(cf curl "/v2/apps/${app_guid}/summary" 2>/dev/null || echo '{}')
@@ -776,15 +784,17 @@ process_app() {
     service_guid=$(jq -r '.guid // empty' <<<"$svc")
     [[ -z "$service_guid" || "$service_guid" == "null" ]] && continue
     service_type=$(jq -r '.type // empty' <<<"$svc")
+    # Capture the developer-assigned service instance name for all service types
+    svc_name=$(jq -r '.name // ""' <<<"$svc")
     if [[ "$service_type" != "user_provided_service_instance" ]]; then
       label=$(jq -r '.service_plan.service.label // ""' <<<"$svc")
       plan=$(jq -r  '.service_plan.name // ""' <<<"$svc")
       service_string="$label ($plan)-($service_guid)"
     else
-      svc_name=$(jq -r '.name // ""' <<<"$svc")
-      service_string="$svc_name (user provided service)-($service_guid)"
+      # For user provided services, the plan is the service name and the label is fixed
       label="User Provided Service"
       plan="$svc_name"
+      service_string="$svc_name (user provided service)-($service_guid)"
     fi
     services_list+=("$service_string")
 
@@ -792,7 +802,7 @@ process_app() {
       csv_write_row "$SERVICE_DATA_OUT" \
         "$stable_key" "$FOUNDATION_SLUG" "$app_guid" "$org_name" "$space_name" \
         "$ENV_LOCATION" "$ENV_TYPE" "$ENV_DATACENTER" \
-        "$service_guid" "$label" "$plan" "$BATCH_ID"
+        "$service_guid" "$label" "$plan" "$svc_name" "$BATCH_ID"
     fi
   done < <(jq -c '.services // [] | .[]' <<<"$summary_json")
 
@@ -886,11 +896,10 @@ process_app() {
     "$buildpack" "$detected_buildpack" "$detected_buildpack_guid" \
     "$buildpack_filename" "$buildpack_version" "$runtime_version" \
     "$droplet_size_bytes" "$packages_size_bytes" "$health_check" "$app_state" "$stack_name" \
-    "$services" "$routes" "$dev_usernames" "$detected_start_command" "$events" \
+    "$services" "$routes" "$dev_usernames" "$detected_start_command" \
     "$stable_key" "$FOUNDATION_SLUG" "$ENV_LOCATION" "$ENV_TYPE" "$ENV_DATACENTER" \
     "$auto_state" "$grouped_buildpack" \
-    "$est_mb" "$extracted_version" "$jre_version" \
-    "$dev_count" "$service_count" "$BATCH_ID"
+    "$est_bytes" "$dev_count" "$service_count" "$BATCH_ID"
 }
 
 export -f process_app fetch_all_pages_v2 fetch_all_pages_v3 \
