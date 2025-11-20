@@ -722,31 +722,6 @@ process_app() {
     buildpack_version="$extracted_version"
   fi
 
-  # In some environments the runtime_version may be absent or blank even for
-  # Java apps.  Try to extract a runtime preference from the app's
-  # buildpack or detected buildpack strings if the version appears there.
-  # For example, a buildpack string like "java-buildpack-v4.70.0#17" may
-  # contain a Java version preference after a hash or at the end.  If
-  # runtime_version is blank and we can find a trailing numeric or
-  # numeric-plus pattern, use it as a fallback runtime preference.
-  if [[ -z "$runtime_version" ]]; then
-    # Look for patterns like '#17', '-17', '_17' or '.17' at the end of the
-    # buildpack or detected buildpack strings.  Also match '17.+' or
-    # '17.+', capturing the leading digits and optional plus.
-    local maybe_ver
-    maybe_ver=""
-    # search buildpack string
-    if [[ "$buildpack" =~ ([0-9]+(\.[0-9]+)?\+?) ]]; then
-      maybe_ver="${BASH_REMATCH[1]}"
-    elif [[ "$detected_buildpack" =~ ([0-9]+(\.[0-9]+)?\+?) ]]; then
-      maybe_ver="${BASH_REMATCH[1]}"
-    fi
-    # Use the fallback if found
-    if [[ -n "$maybe_ver" ]]; then
-      runtime_version="$maybe_ver"
-    fi
-  fi
-
   # ---------------------------------------------------------------
   # At this point, extracted_version holds the buildpack version, and
   # runtime_version holds the version preference (e.g. "17.+").  In
