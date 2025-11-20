@@ -45,8 +45,7 @@ OUTPUT_MODE="${CF_ORCH_DATA_MODE:-multi}"
 BASE_OUTPUT="${CF_ORCH_DATA_OUT:-./foundation_data}"
 
 # Foundation key used for env mapping (can be set from orchestrator)
-FOUNDATION_KEY="${CF_FOUNDATION:-$(echo "${CF_API:-unknown}" \
-                                | sed -e 's~https://api\.~~' -e 's~\..*~~')}"
+FOUNDATION_KEY="${CF_FOUNDATION:-${CF_ORCH_PLATFORM}}"
 
 # Batch tracking (can be provided externally)
 BATCH_ID="${BATCH_ID:-$(date +%Y%m%d_%H%M%S)}"
