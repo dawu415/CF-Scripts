@@ -76,7 +76,57 @@ FOUNDATION_SLUG="${CF_ORCH_PLATFORM:-${FOUNDATION_SLUG:-$FOUNDATION_KEY}}"
 # Organisations to exclude from audit event collection
 IGNORE_ORGS=("system" "p-spring-cloud-services" "Platform-Operations" "splunk-nozzle-org")
 # Audit event types to retain for KPI reporting
-KPI_EVENT_TYPES=("audit.app.process.crash" "audit.app.restart" "audit.app.start" "audit.app.update" "audit.app.scale" "audit.app.process.scale")
+KPI_EVENT_TYPES=(
+  "audit.app.crash"          # v3 crash event
+  "audit.app.process.crash"  # v3 process‑level crash
+  "audit.app.stop"           # app stopped via cf stop
+  "audit.app.start" 
+  "audit.app.restart"        # app restarted
+  "audit.app.update"
+  "audit.app.scale"
+  "audit.app.process.scale"
+  "app.crash"                # v2 crash event for completeness
+)
+
+KPI_EVENT_TYPES+=(
+  # Route lifecycle
+  "audit.route.create" "audit.route.delete-request" "audit.route.update"
+  "audit.route.share" "audit.route.unshare" "audit.route.transfer-owner"
+
+  # Service lifecycle
+  "audit.service.create" "audit.service.delete" "audit.service.update"
+
+  # Service binding lifecycle
+  "audit.service_binding.create" "audit.service_binding.delete"
+  "audit.service_binding.start_create" "audit.service_binding.start_delete"
+  "audit.service_binding.update" "audit.service_binding.show"
+
+  # Service instance lifecycle
+  "audit.service_instance.bind_route" "audit.service_instance.create"
+  "audit.service_instance.delete" "audit.service_instance.share"
+  "audit.service_instance.unbind_route" "audit.service_instance.unshare"
+  "audit.service_instance.update" "audit.service_instance.show"
+  "audit.service_instance.start_create" "audit.service_instance.start_update"
+  "audit.service_instance.start_delete" "audit.service_instance.purge"
+
+  # Service key lifecycle
+  "audit.service_key.create" "audit.service_key.delete"
+  "audit.service_key.start_create" "audit.service_key.start_delete"
+  "audit.service_key.update" "audit.service_key.show"
+
+  # Space lifecycle
+  "audit.space.create" "audit.space.delete-request" "audit.space.update"
+
+  # User lifecycle (role assignments)
+  "audit.user.organization_auditor_add"    "audit.user.organization_auditor_remove"
+  "audit.user.organization_billing_manager_add" "audit.user.organization_billing_manager_remove"
+  "audit.user.organization_manager_add"    "audit.user.organization_manager_remove"
+  "audit.user.organization_user_add"       "audit.user.organization_user_remove"
+  "audit.user.space_auditor_add"           "audit.user.space_auditor_remove"
+  "audit.user.space_supporter_add"         "audit.user.space_supporter_remove"
+  "audit.user.space_developer_add"         "audit.user.space_developer_remove"
+  "audit.user.space_manager_add"           "audit.user.space_manager_remove"
+)
 
 # Toggling parameters for audit event filtering
 #
