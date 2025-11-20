@@ -60,6 +60,37 @@ ENV_DATACENTER="${ENV_DATACENTER:-unknown}"
 # defaulting to the system slug when a platform identifier is available.
 FOUNDATION_SLUG="${CF_ORCH_PLATFORM:-${FOUNDATION_SLUG:-$FOUNDATION_KEY}}"
 
+###############################################################################
+# Audit Event Filtering Configuration
+#
+# IGNORE_ORGS: List of organisation names for which audit event collection will
+#              be skipped entirely. Apps belonging to these orgs will not
+#              trigger any calls to the /v3/audit_events endpoint.
+#
+# KPI_EVENT_TYPES: List of v3 audit-event types that are considered relevant
+#                  for KPI analysis. Only events with a type in this list will
+#                  be processed and written to the audit_events.csv. All other
+#                  event types will be discarded.
+###############################################################################
+
+# Organisations to exclude from audit event collection
+IGNORE_ORGS=("system" "p-spring-cloud-services" "Platform-Operations" "splunk-nozzle-org")
+# Audit event types to retain for KPI reporting
+KPI_EVENT_TYPES=("audit.app.process.crash" "audit.app.restart" "audit.app.start" "audit.app.update" "audit.app.scale" "audit.app.process.scale")
+
+# Toggling parameters for audit event filtering
+#
+# KPI_FILTER_ENABLED: When set to "1" (default), the script will filter audit
+# events to only include types listed in KPI_EVENT_TYPES.  When set to "0",
+# all audit events returned by the API will be processed and written to
+# audit_events.csv.
+KPI_FILTER_ENABLED="${KPI_FILTER_ENABLED:-1}"
+# ORG_FILTER_ENABLED: When set to "1" (default), audit event collection will
+# be skipped for applications belonging to organisations listed in IGNORE_ORGS.
+# When set to "0", the IGNORE_ORGS list is ignored and audit events will
+# be collected for all orgs.
+ORG_FILTER_ENABLED="${ORG_FILTER_ENABLED:-1}"
+
 echo "Foundation key: $FOUNDATION_KEY" >&2
 echo "Environment:   $ENV_LOCATION / $ENV_TYPE / $ENV_DATACENTER" >&2
 echo "Batch Id:      $BATCH_ID" >&2
@@ -925,8 +956,41 @@ process_app() {
   local events=""
   local events_json="[]"
 
-  events_json="$(fetch_all_pages_v3 "/v3/audit_events?target_guids=${app_guid}")"
+  # Determine whether to collect audit events based on the org.  When
+  # ORG_FILTER_ENABLED=1 (default), skip collection if the app belongs to an
+  # organisation in the IGNORE_ORGS list.  When ORG_FILTER_ENABLED=0, no
+  # org-based skipping is applied.
+  local skip_audit="false"
+  if [[ "$ORG_FILTER_ENABLED" == "1" ]]; then
+    for ignore_org in "${IGNORE_ORGS[@]}"; do
+      if [[ "$org_name" == "$ignore_org" ]]; then
+        skip_audit="true"
+        break
+      fi
+    done
+  fi
 
+  if [[ "$skip_audit" == "false" && -n "$AUDIT_EVENTS_OUT" ]]; then
+    # Fetch all audit events for this app
+    events_json="$(fetch_all_pages_v3 "/v3/audit_events?target_guids=${app_guid}")"
+    # Optionally filter events down to KPI-relevant types when KPI_FILTER_ENABLED=1
+    if [[ "$KPI_FILTER_ENABLED" == "1" && "$(jq 'length' <<<"$events_json")" -gt 0 ]]; then
+      # Build a jq boolean expression from KPI_EVENT_TYPES
+      local kpi_expr=""
+      local _evt
+      for _evt in "${KPI_EVENT_TYPES[@]}"; do
+        kpi_expr+=".type == \"${_evt}\" or "
+      done
+      # Trim the trailing ' or '
+      kpi_expr="${kpi_expr% or }"
+      events_json="$(jq -c "[.[] | select(${kpi_expr})]" <<<"$events_json")"
+    fi
+  fi
+
+  # If no events remain or collection was skipped, ensure events_json is an empty array
+  [[ -z "$events_json" || "$events_json" == "null" ]] && events_json="[]"
+
+  # Write filtered audit events (if any)
   if [[ "$(jq 'length' <<<"$events_json")" -gt 0 ]]; then
     if [[ -n "$AUDIT_EVENTS_OUT" ]]; then
       while IFS= read -r event; do
@@ -944,13 +1008,6 @@ process_app() {
       done < <(jq -c '.[]' <<<"$events_json")
     fi
     events="$(jq -cr '.[]?' <<<"$events_json" | paste -sd ':#:' -)"
-  else
-    local events_url
-    events_url="$(jq -r '.entity.events_url // empty' <<<"$app")"
-    if [[ -n "$events_url" ]]; then
-      events_json="$(fetch_all_pages_v2 "$events_url")"
-      events="$(jq -cr '.resources[]?' <<<"$events_json" | paste -sd ':#:' -)"
-    fi
   fi
 
   # ------------------------ developer count ------------------------
