@@ -89,6 +89,18 @@ KPI_EVENT_TYPES=(
 )
 
 KPI_EVENT_TYPES+=(
+  # Application deployment
+  "audit.app.apply_manifest"
+  "audit.app.build.create"
+  "audit.app.copy-bits"
+
+  # Application lifecycle
+  "audit.app.process.create"
+  "audit.app.process.delete"
+  "audit.app.process.update"
+  "audit.app.process.terminate_instance"
+  "audit.app.process.ready"
+
   # Route lifecycle
   "audit.route.create" "audit.route.delete-request" "audit.route.update"
   "audit.route.share" "audit.route.unshare" "audit.route.transfer-owner"
@@ -1271,10 +1283,11 @@ if [[ -n "$SERVICE_BINDINGS_OUT" ]]; then
     ' | jq -s 'add'
   }
 
+  # app bindings
   app_jq_script=$(cat <<'JQAPP'
 def safe_name(m; k): (m[0][k]? | objects | .name?) // "N/A";
 def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
-.[ ]
+.[]                                   # iterate over each app binding
 | . as $b
 | ($b.guid // "N/A") as $bid
 | "app" as $btype
@@ -1306,10 +1319,11 @@ def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
 JQAPP
 )
 
+  # key bindings
   key_jq_script=$(cat <<'JQKEY'
 def safe_name(m; k): (m[0][k]? | objects | .name?) // "N/A";
 def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
-.[ ]
+.[]                                   # iterate over each key binding
 | . as $b
 | ($b.guid // "N/A") as $bid
 | "key" as $btype
