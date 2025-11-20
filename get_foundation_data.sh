@@ -45,7 +45,7 @@ OUTPUT_MODE="${CF_ORCH_DATA_MODE:-multi}"
 BASE_OUTPUT="${CF_ORCH_DATA_OUT:-./foundation_data}"
 
 # Foundation key used for env mapping (can be set from orchestrator)
-FOUNDATION_KEY="${CF_FOUNDATION:-$(echo "${CF_API:-unknown}" | sed 's|https://api\.||;s|\..*||')}"
+FOUNDATION_KEY="${CF_FOUNDATION:-$(echo "${CF_API:-unknown}" | sed 's|https://api\.|\;s|\..*||')}"
 
 # Batch tracking (can be provided externally)
 BATCH_ID="${BATCH_ID:-$(date +%Y%m%d_%H%M%S)}"
@@ -243,26 +243,43 @@ get_jre_version() {
   [[ -n "$highest_jre" ]] && echo "$highest_jre" || echo "Unknown"
 }
 
-# ----------------------------- Output Setup -----------------------------
-if [[ "$OUTPUT_MODE" == "multi" ]]; then
-  OUTPUT_DIR="${BASE_OUTPUT%.csv}"
-  mkdir -p "$OUTPUT_DIR"
-  APP_DATA_OUT="$OUTPUT_DIR/app_data.csv"
-  SERVICE_DATA_OUT="$OUTPUT_DIR/service_data.csv"
-  DEVELOPER_DATA_OUT="$OUTPUT_DIR/developer_space_data.csv"
-  JAVA_RUNTIME_OUT="$OUTPUT_DIR/java_runtime_data.csv"
-  AUDIT_EVENTS_OUT="$OUTPUT_DIR/audit_events.csv"
-  SERVICE_BINDINGS_OUT="$OUTPUT_DIR/service_bindings.csv"
-else
-  APP_DATA_OUT="${BASE_OUTPUT%.csv}.csv"
-  SERVICE_DATA_OUT=""
-  DEVELOPER_DATA_OUT=""
-  JAVA_RUNTIME_OUT=""
-  AUDIT_EVENTS_OUT=""
-  SERVICE_BINDINGS_OUT=""
-fi
+###############################################################################
+# Credential Redaction
+#
+# By default, the script redacts all service credential URIs and JSON payloads
+# when producing the service_bindings.csv. This behaviour is controlled by the
+# environment variable CF_ORCH_REDACT_CREDENTIALS. When set to any value other
+# than "0", redaction is enabled and any non-empty credential field will be
+# replaced with the literal string "[REDACTED]". To disable redaction and
+# include the full credential values, set CF_ORCH_REDACT_CREDENTIALS=0 before
+# running the script.
+#
+###############################################################################
 
-# ----------------------------- CSV helpers -----------------------------
+redact_credentials() {
+  local value="$1"
+  # If CF_ORCH_REDACT_CREDENTIALS is explicitly set to "0", return the original value.
+  if [[ "${CF_ORCH_REDACT_CREDENTIALS:-1}" == "0" ]]; then
+    printf '%s' "$value"
+  else
+    # When redacting, preserve empties; otherwise emit a constant marker.
+    if [[ -z "$value" ]]; then
+      printf '%s' ""
+    else
+      printf '[REDACTED]'
+    fi
+  fi
+}
+export -f redact_credentials
+
+###############################################################################
+# CSV Helpers
+#
+# The helper functions below provide simple CSV cell and row formatting, as well
+# as atomic write operations with file locking. These are used throughout the
+# script to reliably construct the output CSV files.
+###############################################################################
+
 csv_cell() {
   local s="${1//$'\r'/ }"
   s="${s//$'\n'/ }"
@@ -314,7 +331,13 @@ csv_write_row() {
 
 export -f csv_cell csv_row csv_write_header csv_write_row
 
-# ----------------------------- Buildpack helpers -----------------------------
+###############################################################################
+# Buildpack Helpers
+#
+# A collection of helper functions to simplify buildpack names, extract version
+# information from buildpack filenames, and perform other lookup operations.
+###############################################################################
+
 simplify_buildpack_name() {
   local bp="$1"
   [[ -z "$bp" || "$bp" == "null" ]] && { echo "Unknown"; return; }
@@ -355,7 +378,14 @@ extract_full_version() {
   fi
 }
 
-# ----------------------------- Pagination helpers -----------------------------
+###############################################################################
+# Pagination Helpers
+#
+# Helper functions to fetch paginated results from the CF API across both v2 and
+# v3 endpoints. These utilities ensure that all pages of data are retrieved
+# in a single call.
+###############################################################################
+
 fetch_all_pages_v2() {
   local base_path="$1"
   local url="$base_path"
@@ -401,7 +431,14 @@ fetch_all_pages_v3() {
   } | jq -s '[.[]]'
 }
 
-# ----------------------------- Cache setup -----------------------------
+###############################################################################
+# Cache Setup
+#
+# Prepare on-disk caches for expensive API calls such as buildpacks, spaces,
+# organizations and stacks. These caches are keyed by the foundation and avoid
+# repeated API hits when the script is executed multiple times.
+###############################################################################
+
 ORCH_OUT_DIR="${CF_ORCH_OUT_DIR:-$PWD/outputs}"
 if [[ -n "${CF_ORCH_CACHE_ROOT:-}" ]]; then
   CACHE_ROOT="$CF_ORCH_CACHE_ROOT"
@@ -441,7 +478,15 @@ tmp_stacks="$(mktemp "${CACHE_ROOT%/}/.stacks.json.tmp.XXXXXX")"
 fetch_all_pages_v2 "/v2/stacks" >"$tmp_stacks" || echo '{"resources":[]}' >"$tmp_stacks"
 mv -f "$tmp_stacks" "$STACKS_JSON_FILE"
 
-# ----------------------------- Lookups -----------------------------
+###############################################################################
+# Lookups
+#
+# A set of helper functions that perform lookups against cached data or the CF
+# API to determine buildpack filenames, version information, stack names,
+# organization/space names and more. These functions abstract away the details
+# of the underlying API structure and caching mechanics.
+###############################################################################
+
 get_buildpack_filename() {
   local bp_key="$1" stack_name="${2:-}" out=""
   if [[ -s "$BUILDPACKS_JSON_FILE" ]]; then
@@ -552,7 +597,37 @@ get_space_org_names_safe() {
   printf '%s|%s\n' "$space_name" "$org_name"
 }
 
-# ----------------------------- Initialize output files -----------------------------
+###############################################################################
+# Output Setup
+#
+# Prepare output paths and write CSV headers based on the selected output mode.
+###############################################################################
+
+if [[ "$OUTPUT_MODE" == "multi" ]]; then
+  OUTPUT_DIR="${BASE_OUTPUT%.csv}"
+  mkdir -p "$OUTPUT_DIR"
+  APP_DATA_OUT="$OUTPUT_DIR/app_data.csv"
+  SERVICE_DATA_OUT="$OUTPUT_DIR/service_data.csv"
+  DEVELOPER_DATA_OUT="$OUTPUT_DIR/developer_space_data.csv"
+  JAVA_RUNTIME_OUT="$OUTPUT_DIR/java_runtime_data.csv"
+  AUDIT_EVENTS_OUT="$OUTPUT_DIR/audit_events.csv"
+  SERVICE_BINDINGS_OUT="$OUTPUT_DIR/service_bindings.csv"
+else
+  APP_DATA_OUT="${BASE_OUTPUT%.csv}.csv"
+  SERVICE_DATA_OUT=""
+  DEVELOPER_DATA_OUT=""
+  JAVA_RUNTIME_OUT=""
+  AUDIT_EVENTS_OUT=""
+  SERVICE_BINDINGS_OUT=""
+fi
+
+###############################################################################
+# Initialize CSV Files
+#
+# Define column headers for each CSV and write them out if the file is empty or
+# if CF_ORCH_FORCE_HEADER is set.
+###############################################################################
+
 echo "Initializing output files..." >&2
 
 APP_HEADER=(
@@ -605,7 +680,15 @@ csv_write_header "$APP_DATA_OUT"        "${APP_HEADER[@]}"
 [[ -n "$AUDIT_EVENTS_OUT" ]]    && csv_write_header "$AUDIT_EVENTS_OUT"    "${EVENTS_HEADER[@]}"
 [[ -n "$SERVICE_BINDINGS_OUT" ]] && csv_write_header "$SERVICE_BINDINGS_OUT" "${BINDINGS_HEADER[@]}"
 
-# ----------------------------- Process app data -----------------------------
+###############################################################################
+# Process App Data
+#
+# The process_app function handles per-app logic to generate rows for the app
+# inventory as well as service data, developer data, Java runtime data, and
+# audit events. It is designed to be called concurrently to speed up
+# processing across a large number of applications.
+###############################################################################
+
 declare -A SPACE_DEV_SEEN
 
 process_app() {
@@ -624,17 +707,17 @@ process_app() {
   local dl pl droplet_size_bytes="" packages_size_bytes=""
   dl=$(cf curl "/v3/apps/${app_guid}/droplets" 2>/dev/null | jq -r '.resources // [] | .[0].links.download.href // empty' | sed 's|http[s]*://[^/]*||')
   pl=$(cf curl "/v3/apps/${app_guid}/packages" 2>/dev/null | jq -r '.resources // [] | .[0].links.download.href // empty' | sed 's|http[s]*://[^/]*||')
-  [[ -n "$dl" ]] && droplet_size_bytes=$(
+  [[ -n "$dl" ]] && droplet_size_bytes=$( (
     cf curl -X HEAD -v "$dl" 2>&1 \
       | awk -F': ' '/Content-Length:/ {gsub(/\r/,"",$2); print $2; exit}' \
     || true
-    )
+    ))
 
-  [[ -n "$pl" ]] && packages_size_bytes=$(
+  [[ -n "$pl" ]] && packages_size_bytes=$( (
     cf curl -X HEAD -v "$pl" 2>&1 \
       | awk -F': ' '/Content-Length:/ {gsub(/\r/,"",$2); print $2; exit}' \
     || true
-    )
+    ))
 
   local health_check app_state
   health_check=$(jq -r '.entity.health_check_type // empty' <<<"$app")
@@ -986,7 +1069,15 @@ if (( overall_status != 0 )); then
 fi
 
 echo "Note: Developer_Count in app_data is per-app; developer_space_data provides normalized per-space records." >&2
-# ----------------------------- Service bindings (all brokers) -----------------------------
+###############################################################################
+# Service bindings (all brokers)
+#
+# Collect service binding information across all brokers. This section fetches
+# all service brokers and iterates through each to produce service binding
+# rows for app bindings, key bindings, and unbound service instances. It
+# leverages parallelism and caching to efficiently gather the necessary data.
+###############################################################################
+
 if [[ -n "$SERVICE_BINDINGS_OUT" ]]; then
   echo "Collecting service binding data (all brokers)..." >&2
 
@@ -1076,7 +1167,7 @@ if [[ -n "$SERVICE_BINDINGS_OUT" ]]; then
   app_jq_script=$(cat <<'JQAPP'
 def safe_name(m; k): (m[0][k]? | objects | .name?) // "N/A";
 def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
-.[]
+.[ ]
 | . as $b
 | ($b.guid // "N/A") as $bid
 | "app" as $btype
@@ -1111,7 +1202,7 @@ JQAPP
   key_jq_script=$(cat <<'JQKEY'
 def safe_name(m; k): (m[0][k]? | objects | .name?) // "N/A";
 def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
-.[]
+.[ ]
 | . as $b
 | ($b.guid // "N/A") as $bid
 | "key" as $btype
@@ -1283,11 +1374,16 @@ JQUNB
       --slurpfile DET   "$det_app_file" \
       "$app_jq_script" <<<"$app_bindings" \
     | while IFS=$'\t' read -r broker_name bt offer_name plan_name si_name si_guid binding_guid binding_name app_name app_guid space_name space_guid org_name org_guid cred_uri creds_json; do
+        # Apply credential redaction logic. When CF_ORCH_REDACT_CREDENTIALS != 0,
+        # non-empty values are replaced with [REDACTED].
+        local redacted_uri redacted_creds
+        redacted_uri=$(redact_credentials "$cred_uri")
+        redacted_creds=$(redact_credentials "$creds_json")
         csv_write_row "$SERVICE_BINDINGS_OUT" \
           "$broker_name" "$bt" "$offer_name" "$plan_name" \
           "$si_name" "$si_guid" "$binding_guid" "$binding_name" \
           "$app_name" "$app_guid" "$space_name" "$space_guid" \
-          "$org_name" "$org_guid" "$cred_uri" "$creds_json" \
+          "$org_name" "$org_guid" "$redacted_uri" "$redacted_creds" \
           "$FOUNDATION_SLUG" "$BATCH_ID"
       done
 
@@ -1300,11 +1396,16 @@ JQUNB
       --slurpfile DET   "$det_key_file" \
       "$key_jq_script" <<<"$key_bindings" \
     | while IFS=$'\t' read -r broker_name bt offer_name plan_name si_name si_guid binding_guid binding_name app_name app_guid space_name space_guid org_name org_guid cred_uri creds_json; do
+        # Apply credential redaction logic. When CF_ORCH_REDACT_CREDENTIALS != 0,
+        # non-empty values are replaced with [REDACTED].
+        local redacted_uri redacted_creds
+        redacted_uri=$(redact_credentials "$cred_uri")
+        redacted_creds=$(redact_credentials "$creds_json")
         csv_write_row "$SERVICE_BINDINGS_OUT" \
           "$broker_name" "$bt" "$offer_name" "$plan_name" \
           "$si_name" "$si_guid" "$binding_guid" "$binding_name" \
           "$app_name" "$app_guid" "$space_name" "$space_guid" \
-          "$org_name" "$org_guid" "$cred_uri" "$creds_json" \
+          "$org_name" "$org_guid" "$redacted_uri" "$redacted_creds" \
           "$FOUNDATION_SLUG" "$BATCH_ID"
       done
 
@@ -1320,11 +1421,16 @@ JQUNB
       --slurpfile KEYB  "$key_bind_file" \
       "$unbound_jq_script" <<<"$instances" \
     | while IFS=$'\t' read -r broker_name bt offer_name plan_name si_name si_guid binding_guid binding_name app_name app_guid space_name space_guid org_name org_guid cred_uri creds_json; do
+        # Apply credential redaction logic. When CF_ORCH_REDACT_CREDENTIALS != 0,
+        # non-empty values are replaced with [REDACTED].
+        local redacted_uri redacted_creds
+        redacted_uri=$(redact_credentials "$cred_uri")
+        redacted_creds=$(redact_credentials "$creds_json")
         csv_write_row "$SERVICE_BINDINGS_OUT" \
           "$broker_name" "$bt" "$offer_name" "$plan_name" \
           "$si_name" "$si_guid" "$binding_guid" "$binding_name" \
           "$app_name" "$app_guid" "$space_name" "$space_guid" \
-          "$org_name" "$org_guid" "$cred_uri" "$creds_json" \
+          "$org_name" "$org_guid" "$redacted_uri" "$redacted_creds" \
           "$FOUNDATION_SLUG" "$BATCH_ID"
       done
 
