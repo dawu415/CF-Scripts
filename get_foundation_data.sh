@@ -1375,8 +1375,8 @@ JQUNB
       "$app_jq_script" <<<"$app_bindings" \
     | while IFS=$'\t' read -r broker_name bt offer_name plan_name si_name si_guid binding_guid binding_name app_name app_guid space_name space_guid org_name org_guid cred_uri creds_json; do
         # Apply credential redaction logic. When CF_ORCH_REDACT_CREDENTIALS != 0,
-        # non-empty values are replaced with [REDACTED].
-        local redacted_uri redacted_creds
+        # non-empty values are replaced with [REDACTED].  Use plain variables here;
+        # 'local' cannot be used in this loop context because it is not a function.
         redacted_uri=$(redact_credentials "$cred_uri")
         redacted_creds=$(redact_credentials "$creds_json")
         csv_write_row "$SERVICE_BINDINGS_OUT" \
@@ -1397,8 +1397,8 @@ JQUNB
       "$key_jq_script" <<<"$key_bindings" \
     | while IFS=$'\t' read -r broker_name bt offer_name plan_name si_name si_guid binding_guid binding_name app_name app_guid space_name space_guid org_name org_guid cred_uri creds_json; do
         # Apply credential redaction logic. When CF_ORCH_REDACT_CREDENTIALS != 0,
-        # non-empty values are replaced with [REDACTED].
-        local redacted_uri redacted_creds
+        # non-empty values are replaced with [REDACTED].  Use plain variables here;
+        # 'local' cannot be used in this loop context because it is not a function.
         redacted_uri=$(redact_credentials "$cred_uri")
         redacted_creds=$(redact_credentials "$creds_json")
         csv_write_row "$SERVICE_BINDINGS_OUT" \
@@ -1422,8 +1422,8 @@ JQUNB
       "$unbound_jq_script" <<<"$instances" \
     | while IFS=$'\t' read -r broker_name bt offer_name plan_name si_name si_guid binding_guid binding_name app_name app_guid space_name space_guid org_name org_guid cred_uri creds_json; do
         # Apply credential redaction logic. When CF_ORCH_REDACT_CREDENTIALS != 0,
-        # non-empty values are replaced with [REDACTED].
-        local redacted_uri redacted_creds
+        # non-empty values are replaced with [REDACTED].  Use plain variables here;
+        # 'local' cannot be used in this loop context because it is not a function.
         redacted_uri=$(redact_credentials "$cred_uri")
         redacted_creds=$(redact_credentials "$creds_json")
         csv_write_row "$SERVICE_BINDINGS_OUT" \
