@@ -1319,7 +1319,7 @@ def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
 JQAPP
 )
 
-  # key bindings
+  # key bindings – now include space & org for the underlying service instance
   key_jq_script=$(cat <<'JQKEY'
 def safe_name(m; k): (m[0][k]? | objects | .name?) // "N/A";
 def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
@@ -1331,6 +1331,7 @@ def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
 | ($b.relationships.service_instance.data.guid? // null) as $si
 | (safe_val($INST; $si; "plan_guid"))            as $plan_guid
 | (safe_val($PLAN; $plan_guid; "offering_guid")) as $off_guid
+| (safe_val($INST; $si; "space_guid"))           as $space_guid
 | ($DET[0][$bid].credentials? // {}) as $creds
 | ($creds.url // $creds.uri // $creds.connection // $creds.jdbcUrl // $creds.jdbc_url // "") as $uri
 | [
@@ -1343,14 +1344,17 @@ def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
     $bid,
     $bname,
     "", "",
-    "", "",
-    "", "",
+    safe_name($SPACE; $space_guid),
+    ($space_guid // ""),
+    safe_name($ORG;   (safe_val($SPACE; $space_guid; "org_guid"))),
+    (safe_val($SPACE; $space_guid; "org_guid") // ""),
     ($uri // ""),
     (if $creds=={} then "" else ($creds|tojson) end)
   ] | @tsv
 JQKEY
 )
 
+  # unbound instances – ensure we always derive space/org from the instance
   unbound_jq_script=$(cat <<'JQUNB'
 def safe_name(m; k): (m[0][k]? | objects | .name?) // "N/A";
 def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
@@ -1368,7 +1372,7 @@ def bound_si_guids:
 | "" as $bname
 | (safe_val($INST; $si; "plan_guid"))            as $plan_guid
 | (safe_val($PLAN; $plan_guid; "offering_guid")) as $off_guid
-| (safe_val($INST; $si; "space_guid"))           as $space_guid
+| (safe_val($INST; $si; "space_guid") // ($i.relationships.space.data.guid // null)) as $space_guid
 | [
     $BROKER,
     $btype,
@@ -1416,8 +1420,20 @@ JQUNB
     fi
     mapfile -t INSTANCE_GUIDS < <(jq -r '.[].guid' <<<"$instances")
 
-    app_bindings="$(fetch_with_param_chunks "/v3/service_credential_bindings" "service_instance_guids" 50 "type=app" "${INSTANCE_GUIDS[@]}")"
-    key_bindings="$(fetch_with_param_chunks "/v3/service_credential_bindings" "service_instance_guids" 50 "type=key" "${INSTANCE_GUIDS[@]}")"
+    # Fetch all credential bindings for these service instances in a single call.
+    # We deliberately avoid using the 'type' filter here because not all CAPI
+    # versions support it; filtering is done locally instead.
+    bindings="$(fetch_with_param_chunks "/v3/service_credential_bindings" "service_instance_guids" 50 "" "${INSTANCE_GUIDS[@]}")"
+    app_bindings=$(jq -c '[.[] |
+      select(
+        (.type // "") == "app"
+        or ((.type // "") == "" and (.relationships.app // null) != null)
+      )]' <<<"$bindings")
+    key_bindings=$(jq -c '[.[] |
+      select(
+        (.type // "") == "key"
+        or ((.type // "") == "" and (.relationships.app // null) == null)
+      )]' <<<"$bindings")
 
     mapfile -t APP_GUIDS < <(jq -r '.[].relationships.app.data.guid' <<<"$app_bindings" | sort -u)
     apps='[]'
@@ -1495,9 +1511,6 @@ JQUNB
       --slurpfile DET   "$det_app_file" \
       "$app_jq_script" <<<"$app_bindings" \
     | while IFS=$'\t' read -r broker_name bt offer_name plan_name si_name si_guid binding_guid binding_name app_name app_guid space_name space_guid org_name org_guid cred_uri creds_json; do
-        # Apply credential redaction logic. When CF_ORCH_REDACT_CREDENTIALS != 0,
-        # non-empty values are replaced with [REDACTED].  Use plain variables here;
-        # 'local' cannot be used in this loop context because it is not a function.
         redacted_uri=$(redact_credentials "$cred_uri")
         redacted_creds=$(redact_credentials "$creds_json")
         csv_write_row "$SERVICE_BINDINGS_OUT" \
@@ -1514,12 +1527,11 @@ JQUNB
       --slurpfile OFFER "$offer_file" \
       --slurpfile PLAN  "$plan_file" \
       --slurpfile INST  "$inst_file" \
+      --slurpfile SPACE "$space_file" \
+      --slurpfile ORG   "$org_file" \
       --slurpfile DET   "$det_key_file" \
       "$key_jq_script" <<<"$key_bindings" \
     | while IFS=$'\t' read -r broker_name bt offer_name plan_name si_name si_guid binding_guid binding_name app_name app_guid space_name space_guid org_name org_guid cred_uri creds_json; do
-        # Apply credential redaction logic. When CF_ORCH_REDACT_CREDENTIALS != 0,
-        # non-empty values are replaced with [REDACTED].  Use plain variables here;
-        # 'local' cannot be used in this loop context because it is not a function.
         redacted_uri=$(redact_credentials "$cred_uri")
         redacted_creds=$(redact_credentials "$creds_json")
         csv_write_row "$SERVICE_BINDINGS_OUT" \
@@ -1542,9 +1554,6 @@ JQUNB
       --slurpfile KEYB  "$key_bind_file" \
       "$unbound_jq_script" <<<"$instances" \
     | while IFS=$'\t' read -r broker_name bt offer_name plan_name si_name si_guid binding_guid binding_name app_name app_guid space_name space_guid org_name org_guid cred_uri creds_json; do
-        # Apply credential redaction logic. When CF_ORCH_REDACT_CREDENTIALS != 0,
-        # non-empty values are replaced with [REDACTED].  Use plain variables here;
-        # 'local' cannot be used in this loop context because it is not a function.
         redacted_uri=$(redact_credentials "$cred_uri")
         redacted_creds=$(redact_credentials "$creds_json")
         csv_write_row "$SERVICE_BINDINGS_OUT" \
