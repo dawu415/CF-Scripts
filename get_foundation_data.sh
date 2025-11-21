@@ -4,7 +4,7 @@
 #
 # Unified data collector for a single Tanzu / CF foundation.
 #
-# Outputs (in multi-table mode):
+# Outputs (in multi‑table mode):
 #   app_data.csv              - core app inventory + env metadata + buildpack/runtime
 #   service_data.csv          - app ⇄ service-instance relationships (normalized)
 #   developer_space_data.csv  - Org/Space/Developer (normalized)
@@ -12,9 +12,20 @@
 #   audit_events.csv          - audit events per app (v3, with v2 fallback)
 #   service_bindings.csv      - all brokers, app bindings, service keys, unbound instances
 #
-# Designed to work with Run-EnvOrchestrator.ps1. When CF_ORCH_DATA_MODE=multi,
-# CF_ORCH_DATA_OUT is treated as a *base path/directory* and multiple CSVs
-# are created beneath it.
+# High-level execution flow:
+#   1) preload_foundation_metadata    - caches buildpacks/spaces/orgs/stacks
+#   2) init_output_paths_and_headers  - sets output paths + CSV headers
+#   3) snapshot /v2/apps              - writes APPS_JSON_FILE
+#   4) build_space_dev_cache          - space_guid → colon-separated dev usernames
+#   5) run three phases in parallel:
+#        - run_app_phase              - app_data, service_data, java_runtime_data, audit_events
+#        - run_developer_space_phase  - developer_space_data (normalized)
+#        - run_service_bindings_phase - service_bindings from all brokers
+#
+# Concurrency knobs:
+#   WORKERS            - per-app workers (default: 6)
+#   SPACE_DEV_WORKERS  - per-space developer cache workers (default: 8)
+#   BROKER_WORKERS     - per-broker workers for bindings (default: 3)
 
 set -Eeuo pipefail
 [ -n "${BASH_VERSION:-}" ] || exec /usr/bin/env bash "$0" "$@"
@@ -24,12 +35,14 @@ export CF_COLOR=false CF_TRACE=false TERM=dumb
 stty -g >/dev/null 2>&1 || true
 IFS=$' \t\n'
 
+# Common error trap text reused in subshells
 ORIGINAL_ERR_TRAP='ec=$?; set +u;
       ts=$(date "+%F %T" 2>/dev/null || printf N/A);
       src="${BASH_SOURCE[0]:-$0}"; fn="${FUNCNAME[0]:-main}";
       echo "[$ts] ERROR ${ec:-1} at ${src}:${LINENO}: ${fn}: ${BASH_COMMAND:-?}" >&2;
       exit "${ec:-1}"'
 
+# Basic dependency checks
 command -v cf    >/dev/null 2>&1 || { echo "cf CLI not found in PATH" >&2; exit 6; }
 command -v jq    >/dev/null 2>&1 || { echo "jq not found in PATH" >&2; exit 6; }
 command -v xargs >/dev/null 2>&1 || { echo "xargs not found in PATH" >&2; exit 6; }
@@ -54,23 +67,12 @@ BATCH_ID="${BATCH_ID:-$(date +%Y%m%d_%H%M%S)}"
 ENV_LOCATION="${ENV_LOCATION:-unknown}"
 ENV_TYPE="${ENV_TYPE:-unknown}"
 ENV_DATACENTER="${ENV_DATACENTER:-unknown}"
-# When an orchestrator provides CF_ORCH_PLATFORM, prefer that value as the
-# foundation slug.  Otherwise, fall back to any pre-set FOUNDATION_SLUG and
-# ultimately the FOUNDATION_KEY derived from the API host.  This avoids
-# defaulting to the system slug when a platform identifier is available.
+
+# Preferred foundation slug (used in Stable_Key, CSVs, etc.)
 FOUNDATION_SLUG="${CF_ORCH_PLATFORM:-${FOUNDATION_SLUG:-$FOUNDATION_KEY}}"
 
 ###############################################################################
 # Audit Event Filtering Configuration
-#
-# IGNORE_ORGS: List of organisation names for which audit event collection will
-#              be skipped entirely. Apps belonging to these orgs will not
-#              trigger any calls to the /v3/audit_events endpoint.
-#
-# KPI_EVENT_TYPES: List of v3 audit-event types that are considered relevant
-#                  for KPI analysis. Only events with a type in this list will
-#                  be processed and written to the audit_events.csv. All other
-#                  event types will be discarded.
 ###############################################################################
 
 # Organisations to exclude from audit event collection
@@ -78,15 +80,15 @@ IGNORE_ORGS=("system" "p-spring-cloud-services" "Platform-Operations" "splunk-no
 
 # Audit event types to retain for KPI reporting
 KPI_EVENT_TYPES=(
-  "audit.app.crash"          # v3 crash event
-  "audit.app.process.crash"  # v3 process‑level crash
-  "audit.app.stop"           # app stopped via cf stop
-  "audit.app.start" 
-  "audit.app.restart"        # app restarted
+  "audit.app.crash"
+  "audit.app.process.crash"
+  "audit.app.stop"
+  "audit.app.start"
+  "audit.app.restart"
   "audit.app.update"
   "audit.app.scale"
   "audit.app.process.scale"
-  "app.crash"                # v2 crash event for completeness
+  "app.crash"
 )
 
 KPI_EVENT_TYPES+=(
@@ -142,25 +144,13 @@ KPI_EVENT_TYPES+=(
 )
 
 # Toggling parameters for audit event filtering
-#
-# KPI_FILTER_ENABLED: When set to "1" (default), the script will filter audit
-# events to only include types listed in KPI_EVENT_TYPES.  When set to "0",
-# all audit events returned by the API will be processed and written to
-# audit_events.csv.
-KPI_FILTER_ENABLED="${KPI_FILTER_ENABLED:-1}"
-# ORG_FILTER_ENABLED: When set to "1" (default), audit event collection will
-# be skipped for applications belonging to organisations listed in IGNORE_ORGS.
-# When set to "0", the IGNORE_ORGS list is ignored and audit events will
-# be collected for all orgs.
-ORG_FILTER_ENABLED="${ORG_FILTER_ENABLED:-1}"
-
-echo "Foundation key: $FOUNDATION_KEY" >&2
-echo "Environment:   $ENV_LOCATION / $ENV_TYPE / $ENV_DATACENTER" >&2
-echo "Batch Id:      $BATCH_ID" >&2
+KPI_FILTER_ENABLED="${KPI_FILTER_ENABLED:-1}"  # 1 = filter to KPI_EVENT_TYPES, 0 = keep all
+ORG_FILTER_ENABLED="${ORG_FILTER_ENABLED:-1}"  # 1 = skip IGNORE_ORGS, 0 = collect for all orgs
 
 # ----------------------------- JRE Version Mapping -----------------------------
-# Ported from JRE.js (jreMap + getJRE) so we can compute JRE versions wholly
-# on the bash side. If you update JRE.js, mirror the changes here.
+# Ported from JRE.js so we can compute JRE versions wholly on the bash side.
+# IMPORTANT: get_jre_version() below defaults to Java 8 when the runtime
+# preference is missing or invalid, matching Java buildpack default behavior.
 
 declare -A JRE_MAP
 
@@ -269,12 +259,20 @@ for v in 4.82.0 4.83.0; do
   JRE_MAP["$v:21"]="21.0.7_9"
 done
 
+# Compute the JRE version for a given buildpack version + runtime preference.
+# Behavior:
+#   - Parse major from runtime_pref (e.g. "17.+" → 17)
+#   - If parse fails, default major=8 (Java 8)
+#   - Try exact mapping for (bp_version:major), and also for (normalized_bp_version:major)
+#   - If no match and major != 8, fall back to major=8 for that buildpack version
+#   - As a last resort, fall back to the highest defined major for that buildpack version.
 get_jre_version() {
   local bp_version="$1"
   local runtime_pref="$2"
 
   [[ -z "$bp_version" || "$bp_version" == "null" ]] && { echo "Unknown"; return; }
 
+  # Normalize only "X.Y.0" → "X.Y". This does NOT turn 4.20 into 4.2.
   local normalized="$bp_version"
   if [[ "$bp_version" =~ ^([0-9]+\.[0-9]+)\.0$ ]]; then
     normalized="${BASH_REMATCH[1]}"
@@ -282,32 +280,52 @@ get_jre_version() {
 
   local major=""
   if [[ -n "$runtime_pref" && "$runtime_pref" != "null" ]]; then
-    if [[ "$runtime_pref" =~ ^1\.([0-9]+) ]]; then
+    if   [[ "$runtime_pref" =~ ^1\.([0-9]+) ]]; then
       major="${BASH_REMATCH[1]}"
     elif [[ "$runtime_pref" =~ ([0-9]+) ]]; then
       major="${BASH_REMATCH[1]}"
     fi
   fi
 
-  # When no valid major is extracted from the runtime preference, default to Java 8.
-  # This aligns with the platform behaviour where Java 8 is chosen when the
-  # developer does not specify a runtime or specifies an invalid one.
+  # Default behavior: when a developer does not specify a runtime, Java
+  # buildpacks choose Java 8. Mirror that here.
   if [[ -z "$major" ]]; then
     major="8"
   fi
 
   local lookup_key
-  lookup_key="${normalized}:${major}"
-  if [[ -n "${JRE_MAP[$lookup_key]:-}" ]]; then
-    echo "${JRE_MAP[$lookup_key]}"
+
+  # Helper: attempt lookup for a given version string + major
+  _lookup_jre_for_version_and_major() {
+    local ver="$1" maj="$2"
+    local key="${ver}:${maj}"
+    if [[ -n "${JRE_MAP[$key]:-}" ]]; then
+      echo "${JRE_MAP[$key]}"
+      return 0
+    fi
+    return 1
+  }
+
+  # 1) First try requested major with both original and normalized version
+  if _lookup_jre_for_version_and_major "$bp_version" "$major"; then
     return
   fi
-  lookup_key="${bp_version}:${major}"
-  if [[ -n "${JRE_MAP[$lookup_key]:-}" ]]; then
-    echo "${JRE_MAP[$lookup_key]}"
+  if [[ "$normalized" != "$bp_version" ]] && _lookup_jre_for_version_and_major "$normalized" "$major"; then
     return
   fi
 
+  # 2) If requested major isn't 8, fall back to Java 8 for this buildpack version
+  if [[ "$major" != "8" ]]; then
+    if _lookup_jre_for_version_and_major "$bp_version" "8"; then
+      return
+    fi
+    if [[ "$normalized" != "$bp_version" ]] && _lookup_jre_for_version_and_major "$normalized" "8"; then
+      return
+    fi
+  fi
+
+  # 3) Last resort: fall back to the highest defined major for this buildpack
+  #    version. This is rarely hit and only when the lookup table is stale.
   local highest_major=0
   local highest_jre=""
   local key
@@ -325,7 +343,8 @@ get_jre_version() {
 }
 
 ###############################################################################
-# Credential Redaction
+# Credential Redaction + Service Credential Fetch Toggle
+###############################################################################
 #
 # CF_ORCH_REDACT_CREDENTIALS:
 #   - default: redact everything (non-empty → "[REDACTED]")
@@ -336,7 +355,6 @@ get_jre_version() {
 #                (credential_uri / credentials_json columns stay empty)
 #   - set PULL_SERVICE_CREDENTIALS=1 → call /details and then redaction
 #     rules apply as above.
-###############################################################################
 
 redact_credentials() {
   local value="$1"
@@ -375,7 +393,7 @@ csv_row() {
   local line="" sep="" a
   for a in "$@"; do
     line+="$sep$(csv_cell "$a")"
-    sep=",";
+    sep=","
   done
   printf '%s\n' "$line"
 }
@@ -434,6 +452,8 @@ simplify_buildpack_name() {
 extract_full_version() {
   local filename="$1"
   [[ -z "$filename" || "$filename" == "null" ]] && { echo ""; return; }
+  # Extract the semantic version portion of a buildpack filename. Mirrors
+  # the Apps Script helper (see Utilities.js) where we look for "-vX.Y[.Z...]".
   if [[ "$filename" =~ -v([0-9]+\.[0-9]+(?:\.[0-9]+)?(?:-[[:alnum:]._-]+)?(?:\+[[:alnum:]._-]+)?) ]]; then
     echo "${BASH_REMATCH[1]}"
   else
@@ -493,57 +513,69 @@ fetch_all_pages_v3() {
 }
 
 ###############################################################################
-# Cache Setup
+# Cache Setup (buildpacks / spaces / orgs / stacks + WORK_DIR)
 ###############################################################################
 
-ORCH_OUT_DIR="${CF_ORCH_OUT_DIR:-$PWD/outputs}"
-if [[ -n "${CF_ORCH_CACHE_ROOT:-}" ]]; then
-  CACHE_ROOT="$CF_ORCH_CACHE_ROOT"
-else
-  CACHE_ROOT="$ORCH_OUT_DIR/cache/$FOUNDATION_KEY"
-fi
-mkdir -p "$CACHE_ROOT"
-echo "Using cache root: $CACHE_ROOT" >&2
+preload_foundation_metadata() {
+  # ORCH_OUT_DIR and CACHE_ROOT define where we keep reusable caches so
+  # that repeated runs on the same foundation are faster.
+  ORCH_OUT_DIR="${CF_ORCH_OUT_DIR:-$PWD/outputs}"
+  if [[ -n "${CF_ORCH_CACHE_ROOT:-}" ]]; then
+    CACHE_ROOT="$CF_ORCH_CACHE_ROOT"
+  else
+    CACHE_ROOT="$ORCH_OUT_DIR/cache/$FOUNDATION_KEY"
+  fi
+  mkdir -p "$CACHE_ROOT"
+  echo "Using cache root: $CACHE_ROOT" >&2
 
-WORK_DIR="$(mktemp -d "${CACHE_ROOT%/}/work.XXXXXX")"
-cleanup() { rm -rf "$WORK_DIR"; }
-trap cleanup EXIT
+  # Per-run workspace; cleaned up at exit
+  WORK_DIR="$(mktemp -d "${CACHE_ROOT%/}/work.XXXXXX")"
+  cleanup() { rm -rf "$WORK_DIR"; }
+  trap cleanup EXIT
 
-BUILDPACKS_JSON_FILE="$CACHE_ROOT/buildpacks.json"
-SPACES_JSON_FILE="$CACHE_ROOT/spaces.json"
-ORGS_JSON_FILE="$CACHE_ROOT/orgs.json"
-STACKS_JSON_FILE="$CACHE_ROOT/stacks.json"
-SPACE_DEVS_JSON_FILE="$CACHE_ROOT/space_developers.json"
+  BUILDPACKS_JSON_FILE="$CACHE_ROOT/buildpacks.json"
+  SPACES_JSON_FILE="$CACHE_ROOT/spaces.json"
+  ORGS_JSON_FILE="$CACHE_ROOT/orgs.json"
+  STACKS_JSON_FILE="$CACHE_ROOT/stacks.json"
+  SPACE_DEVS_JSON_FILE="$CACHE_ROOT/space_developers.json"
 
-export ORCH_OUT_DIR CACHE_ROOT WORK_DIR \
-       BUILDPACKS_JSON_FILE SPACES_JSON_FILE ORGS_JSON_FILE STACKS_JSON_FILE SPACE_DEVS_JSON_FILE
+  export ORCH_OUT_DIR CACHE_ROOT WORK_DIR \
+         BUILDPACKS_JSON_FILE SPACES_JSON_FILE ORGS_JSON_FILE STACKS_JSON_FILE SPACE_DEVS_JSON_FILE
 
-echo "Preloading foundation metadata..." >&2
+  echo "Preloading foundation metadata..." >&2
 
-tmp_bp="$(mktemp "${CACHE_ROOT%/}/.buildpacks.json.tmp.XXXXXX")"
-cf curl "/v2/buildpacks?results-per-page=100" 2>/dev/null >"$tmp_bp" || echo '{}' >"$tmp_bp"
-mv -f "$tmp_bp" "$BUILDPACKS_JSON_FILE"
+  local tmp_bp tmp_spaces tmp_orgs tmp_stacks
 
-tmp_spaces="$(mktemp "${CACHE_ROOT%/}/.spaces.json.tmp.XXXXXX")"
-fetch_all_pages_v2 "/v2/spaces" >"$tmp_spaces" || echo '{"resources":[]}' >"$tmp_spaces"
-mv -f "$tmp_spaces" "$SPACES_JSON_FILE"
+  tmp_bp="$(mktemp "${CACHE_ROOT%/}/.buildpacks.json.tmp.XXXXXX")"
+  cf curl "/v2/buildpacks?results-per-page=100" 2>/dev/null >"$tmp_bp" || echo '{}' >"$tmp_bp"
+  mv -f "$tmp_bp" "$BUILDPACKS_JSON_FILE"
 
-tmp_orgs="$(mktemp "${CACHE_ROOT%/}/.orgs.json.tmp.XXXXXX")"
-fetch_all_pages_v2 "/v2/organizations" >"$tmp_orgs" || echo '{"resources":[]}' >"$tmp_orgs"
-mv -f "$tmp_orgs" "$ORGS_JSON_FILE"
+  tmp_spaces="$(mktemp "${CACHE_ROOT%/}/.spaces.json.tmp.XXXXXX")"
+  fetch_all_pages_v2 "/v2/spaces" >"$tmp_spaces" || echo '{"resources":[]}' >"$tmp_spaces"
+  mv -f "$tmp_spaces" "$SPACES_JSON_FILE"
 
-tmp_stacks="$(mktemp "${CACHE_ROOT%/}/.stacks.json.tmp.XXXXXX")"
-fetch_all_pages_v2 "/v2/stacks" >"$tmp_stacks" || echo '{"resources":[]}' >"$tmp_stacks"
-mv -f "$tmp_stacks" "$STACKS_JSON_FILE"
+  tmp_orgs="$(mktemp "${CACHE_ROOT%/}/.orgs.json.tmp.XXXXXX")"
+  fetch_all_pages_v2 "/v2/organizations" >"$tmp_orgs" || echo '{"resources":[]}' >"$tmp_orgs"
+  mv -f "$tmp_orgs" "$ORGS_JSON_FILE"
+
+  tmp_stacks="$(mktemp "${CACHE_ROOT%/}/.stacks.json.tmp.XXXXXX")"
+  fetch_all_pages_v2 "/v2/stacks" >"$tmp_stacks" || echo '{"resources":[]}' >"$tmp_stacks"
+  mv -f "$tmp_stacks" "$STACKS_JSON_FILE"
+}
 
 ###############################################################################
 # Lookups & Developer Cache
 ###############################################################################
 
+# Build a simple map: SPACE_GUID → colon-separated list of usernames
+# This is used by:
+#   - process_app()     → to compute per-app Developer_Count and Developers column
+#   - write_developer_space_data() → normalized per-space developer CSV
 build_space_dev_cache() {
   local out="$SPACE_DEVS_JSON_FILE"
   local tmp; tmp="$(mktemp "${CACHE_ROOT%/}/.space_devs.tmp.XXXXXX")"
 
+  # Collect unique space URLs for spaces that actually have apps in this run
   mapfile -t space_urls < <(
     jq -r '.resources[]?.entity.space_url // empty' "$APPS_JSON_FILE" | sort -u
   )
@@ -630,6 +662,7 @@ get_buildpack_filename() {
   printf '%s' "$out"
 }
 
+# Extract (buildpack_version | runtime_version_pref) from /v2/apps/<guid>/env
 get_version_info() {
   local app_guid="$1" detected_buildpack="$2" buildpack_filename="${3:-}"
   local env_data buildpack_version runtime_version
@@ -697,85 +730,83 @@ get_space_org_names_safe() {
 }
 
 ###############################################################################
-# Output Setup
+# Output Setup (paths + headers)
 ###############################################################################
 
-if [[ "$OUTPUT_MODE" == "multi" ]]; then
-  OUTPUT_DIR="${BASE_OUTPUT%.csv}"
-  mkdir -p "$OUTPUT_DIR"
-  APP_DATA_OUT="$OUTPUT_DIR/app_data.csv"
-  SERVICE_DATA_OUT="$OUTPUT_DIR/service_data.csv"
-  DEVELOPER_DATA_OUT="$OUTPUT_DIR/developer_space_data.csv"
-  JAVA_RUNTIME_OUT="$OUTPUT_DIR/java_runtime_data.csv"
-  AUDIT_EVENTS_OUT="$OUTPUT_DIR/audit_events.csv"
-  SERVICE_BINDINGS_OUT="$OUTPUT_DIR/service_bindings.csv"
-else
-  APP_DATA_OUT="${BASE_OUTPUT%.csv}.csv"
-  SERVICE_DATA_OUT=""
-  DEVELOPER_DATA_OUT=""
-  JAVA_RUNTIME_OUT=""
-  AUDIT_EVENTS_OUT=""
-  SERVICE_BINDINGS_OUT=""
-fi
+init_output_paths_and_headers() {
+  if [[ "$OUTPUT_MODE" == "multi" ]]; then
+    OUTPUT_DIR="${BASE_OUTPUT%.csv}"
+    mkdir -p "$OUTPUT_DIR"
+    APP_DATA_OUT="$OUTPUT_DIR/app_data.csv"
+    SERVICE_DATA_OUT="$OUTPUT_DIR/service_data.csv"
+    DEVELOPER_DATA_OUT="$OUTPUT_DIR/developer_space_data.csv"
+    JAVA_RUNTIME_OUT="$OUTPUT_DIR/java_runtime_data.csv"
+    AUDIT_EVENTS_OUT="$OUTPUT_DIR/audit_events.csv"
+    SERVICE_BINDINGS_OUT="$OUTPUT_DIR/service_bindings.csv"
+  else
+    APP_DATA_OUT="${BASE_OUTPUT%.csv}.csv"
+    SERVICE_DATA_OUT=""
+    DEVELOPER_DATA_OUT=""
+    JAVA_RUNTIME_OUT=""
+    AUDIT_EVENTS_OUT=""
+    SERVICE_BINDINGS_OUT=""
+  fi
+
+  echo "Initializing output files..." >&2
+
+  local APP_HEADER=(
+    "Org_Name" "Space_Name" "Created_At" "Updated_At" "App_Name" "App_GUID"
+    "Instances" "Memory_MB" "Disk_Quota_MB"
+    "Requested_Buildpack" "Detected_Buildpack" "Detected_Buildpack_GUID"
+    "Buildpack_Filename" "Buildpack_Version" "Runtime_Version"
+    "DropletSizeBytes" "PackagesSizeBytes" "HealthCheckType" "App_State" "Stack_Name"
+    "Services" "Routes" "Developers" "Detected_Start_Command"
+    "Stable_Key" "Foundation_Slug" "Env_Location" "Env_Type" "Env_Datacenter"
+    "Buildpack_AutoDetectState" "Grouped_Buildpack"
+    "Estimated_Size_Bytes" "Developer_Count" "Service_Count" "Batch_Id"
+  )
+
+  local SERVICE_HEADER=(
+    "Stable_Key" "Foundation_Slug" "App_GUID" "Org_Name" "Space_Name"
+    "Env_Location" "Env_Type" "Env_Datacenter"
+    "Service_GUID" "Service_Type" "Service_Plan" "Service_Name" "Batch_Id"
+  )
+
+  local DEVELOPER_HEADER=(
+    "Stable_Key" "Foundation_Slug" "Org_Name" "Space_Name"
+    "Env_Location" "Env_Type" "Env_Datacenter"
+    "Developer" "Batch_Id"
+  )
+
+  local JAVA_HEADER=(
+    "App_GUID" "App_Name" "Org_Name" "Space_Name"
+    "Buildpack_Version" "Runtime_Version" "JRE_Version"
+    "Foundation_Slug" "Batch_Id"
+  )
+
+  local EVENTS_HEADER=(
+    "App_GUID" "App_Name" "Event_Type" "Actor" "Actor_Type" "Actor_Name"
+    "Timestamp" "Metadata" "Foundation_Slug" "Batch_Id"
+  )
+
+  local BINDINGS_HEADER=(
+    "broker_name" "binding_type" "service_offering_name" "service_plan_name"
+    "service_instance_name" "service_instance_guid" "service_binding_guid"
+    "binding_name" "app_name" "app_guid" "space_name" "space_guid"
+    "org_name" "org_guid" "credential_uri" "credentials_json"
+    "Foundation_Slug" "Batch_Id"
+  )
+
+  csv_write_header "$APP_DATA_OUT"        "${APP_HEADER[@]}"
+  [[ -n "$SERVICE_DATA_OUT"     ]] && csv_write_header "$SERVICE_DATA_OUT"     "${SERVICE_HEADER[@]}"
+  [[ -n "$DEVELOPER_DATA_OUT"   ]] && csv_write_header "$DEVELOPER_DATA_OUT"   "${DEVELOPER_HEADER[@]}"
+  [[ -n "$JAVA_RUNTIME_OUT"     ]] && csv_write_header "$JAVA_RUNTIME_OUT"     "${JAVA_HEADER[@]}"
+  [[ -n "$AUDIT_EVENTS_OUT"     ]] && csv_write_header "$AUDIT_EVENTS_OUT"     "${EVENTS_HEADER[@]}"
+  [[ -n "$SERVICE_BINDINGS_OUT" ]] && csv_write_header "$SERVICE_BINDINGS_OUT" "${BINDINGS_HEADER[@]}"
+}
 
 ###############################################################################
-# Initialize CSV Files
-###############################################################################
-
-echo "Initializing output files..." >&2
-
-APP_HEADER=(
-  "Org_Name" "Space_Name" "Created_At" "Updated_At" "App_Name" "App_GUID"
-  "Instances" "Memory_MB" "Disk_Quota_MB"
-  "Requested_Buildpack" "Detected_Buildpack" "Detected_Buildpack_GUID"
-  "Buildpack_Filename" "Buildpack_Version" "Runtime_Version"
-  "DropletSizeBytes" "PackagesSizeBytes" "HealthCheckType" "App_State" "Stack_Name"
-  "Services" "Routes" "Developers" "Detected_Start_Command"
-  "Stable_Key" "Foundation_Slug" "Env_Location" "Env_Type" "Env_Datacenter"
-  "Buildpack_AutoDetectState" "Grouped_Buildpack"
-  "Estimated_Size_Bytes" "Developer_Count" "Service_Count" "Batch_Id"
-)
-
-SERVICE_HEADER=(
-  "Stable_Key" "Foundation_Slug" "App_GUID" "Org_Name" "Space_Name"
-  "Env_Location" "Env_Type" "Env_Datacenter"
-  "Service_GUID" "Service_Type" "Service_Plan" "Service_Name" "Batch_Id"
-)
-
-DEVELOPER_HEADER=(
-  "Stable_Key" "Foundation_Slug" "Org_Name" "Space_Name"
-  "Env_Location" "Env_Type" "Env_Datacenter"
-  "Developer" "Batch_Id"
-)
-
-JAVA_HEADER=(
-  "App_GUID" "App_Name" "Org_Name" "Space_Name"
-  "Buildpack_Version" "Runtime_Version" "JRE_Version"
-  "Foundation_Slug" "Batch_Id"
-)
-
-EVENTS_HEADER=(
-  "App_GUID" "App_Name" "Event_Type" "Actor" "Actor_Type" "Actor_Name"
-  "Timestamp" "Metadata" "Foundation_Slug" "Batch_Id"
-)
-
-BINDINGS_HEADER=(
-  "broker_name" "binding_type" "service_offering_name" "service_plan_name"
-  "service_instance_name" "service_instance_guid" "service_binding_guid"
-  "binding_name" "app_name" "app_guid" "space_name" "space_guid"
-  "org_name" "org_guid" "credential_uri" "credentials_json"
-  "Foundation_Slug" "Batch_Id"
-)
-
-csv_write_header "$APP_DATA_OUT"        "${APP_HEADER[@]}"
-[[ -n "$SERVICE_DATA_OUT" ]]     && csv_write_header "$SERVICE_DATA_OUT"    "${SERVICE_HEADER[@]}"
-[[ -n "$DEVELOPER_DATA_OUT" ]]   && csv_write_header "$DEVELOPER_DATA_OUT"  "${DEVELOPER_HEADER[@]}"
-[[ -n "$JAVA_RUNTIME_OUT" ]]     && csv_write_header "$JAVA_RUNTIME_OUT"    "${JAVA_HEADER[@]}"
-[[ -n "$AUDIT_EVENTS_OUT" ]]     && csv_write_header "$AUDIT_EVENTS_OUT"    "${EVENTS_HEADER[@]}"
-[[ -n "$SERVICE_BINDINGS_OUT" ]] && csv_write_header "$SERVICE_BINDINGS_OUT" "${BINDINGS_HEADER[@]}"
-
-###############################################################################
-# App processing
+# App processing (per-app inventory, services, Java runtime, audit events)
 ###############################################################################
 
 process_app() {
@@ -791,20 +822,22 @@ process_app() {
   detected_buildpack=$(jq -r '.entity.detected_buildpack // empty' <<<"$app")
   detected_buildpack_guid=$(jq -r '.entity.detected_buildpack_guid // empty' <<<"$app")
 
+  # Droplet & package sizes from HEAD on the download URLs (bytes)
   local dl pl droplet_size_bytes="" packages_size_bytes=""
   dl=$(cf curl "/v3/apps/${app_guid}/droplets" 2>/dev/null | jq -r '.resources // [] | .[0].links.download.href // empty' | sed 's|http[s]*://[^/]*||')
   pl=$(cf curl "/v3/apps/${app_guid}/packages" 2>/dev/null | jq -r '.resources // [] | .[0].links.download.href // empty' | sed 's|http[s]*://[^/]*||')
-  [[ -n "$dl" ]] && droplet_size_bytes=$( (
+
+  [[ -n "$dl" ]] && droplet_size_bytes=$(
     cf curl -X HEAD -v "$dl" 2>&1 \
       | awk -F': ' '/Content-Length:/ {gsub(/\r/,"",$2); print $2; exit}' \
-    || true
-  ))
+      || true
+  )
 
-  [[ -n "$pl" ]] && packages_size_bytes=$( (
+  [[ -n "$pl" ]] && packages_size_bytes=$(
     cf curl -X HEAD -v "$pl" 2>&1 \
       | awk -F': ' '/Content-Length:/ {gsub(/\r/,"",$2); print $2; exit}' \
-    || true
-  ))
+      || true
+  )
 
   local health_check app_state
   health_check=$(jq -r '.entity.health_check_type // empty' <<<"$app")
@@ -825,6 +858,7 @@ process_app() {
 
   local stable_key="${FOUNDATION_SLUG}:${org_name}:${space_name}"
 
+  # Buildpack filename lookup (GUID or name)
   local buildpack_filename input
   if [[ "$detected_buildpack_guid" != "null" && -n "$detected_buildpack_guid" ]]; then
     buildpack_filename=$(get_buildpack_filename "$detected_buildpack_guid")
@@ -833,9 +867,11 @@ process_app() {
     buildpack_filename=$(get_buildpack_filename "$input" "$stack_name")
   fi
 
+  # Extract env-level buildpack/runtime info
   local buildpack_version runtime_version
   IFS='|' read -r buildpack_version runtime_version <<<"$(get_version_info "$app_guid" "$detected_buildpack" "$buildpack_filename")"
 
+  # Determine whether buildpack was auto-detected or manually requested
   local auto_state="NotFound"
   local reqVal="$buildpack"
   local detVal="$detected_buildpack"
@@ -850,6 +886,7 @@ process_app() {
     auto_state="ManuallyRequested"
   fi
 
+  # Decide which buildpack string drives grouping + version inference
   local lookup_val="$buildpack_filename"
   if [[ -z "$lookup_val" || "$lookup_val" == "null" ]]; then
     if [[ "$auto_state" == "ManuallyRequested" ]]; then
@@ -865,6 +902,7 @@ process_app() {
   local grouped_buildpack
   grouped_buildpack=$(simplify_buildpack_name "$lookup_val")
 
+  # Prefer version from buildpack filename (full semver) over bare numeric from env.
   local extracted_version=""
   if [[ -n "$buildpack_filename" && "$buildpack_filename" != "null" ]]; then
     extracted_version=$(extract_full_version "$buildpack_filename")
@@ -877,26 +915,29 @@ process_app() {
       extracted_version="${BASH_REMATCH[1]}"
     fi
   fi
-
   if [[ -n "$extracted_version" ]]; then
     buildpack_version="$extracted_version"
   fi
 
+  # Fields used for java_runtime_data.csv
   local bp_version_field="$extracted_version"
   [[ -z "$bp_version_field" ]] && bp_version_field="Unknown"
   local runtime_version_field="$runtime_version"
 
+  # JRE mapping for Java apps; default behavior matches Java buildpack (8 when unspecified)
   local jre_version=""
   if [[ "$grouped_buildpack" =~ [Jj]ava ]]; then
     jre_version=$(get_jre_version "$extracted_version" "$runtime_version")
   fi
 
+  # Total estimated bytes (droplet + package)
   local total_bytes=0
-  [[ -n "$droplet_size_bytes" && "$droplet_size_bytes" =~ ^[0-9]+$ ]] && ((total_bytes += droplet_size_bytes))
+  [[ -n "$droplet_size_bytes"  && "$droplet_size_bytes"  =~ ^[0-9]+$ ]] && ((total_bytes += droplet_size_bytes))
   [[ -n "$packages_size_bytes" && "$packages_size_bytes" =~ ^[0-9]+$ ]] && ((total_bytes += packages_size_bytes))
   local est_bytes=""
   [[ $total_bytes -gt 0 ]] && est_bytes="$total_bytes"
 
+  # v2 summary for routes and bound services
   local summary_json routes
   summary_json=$(cf curl "/v2/apps/${app_guid}/summary" 2>/dev/null || echo '{}')
   routes=$(jq -r '.routes // [] | .[] | (.host + "." + .domain.name)' <<<"$summary_json" | paste -sd ':' -)
@@ -1014,25 +1055,34 @@ process_app() {
     "$est_bytes" "$dev_count" "$service_count" "$BATCH_ID"
 }
 
-export -f process_app fetch_all_pages_v2 fetch_all_pages_v3 \
-  get_buildpack_filename get_version_info get_stack_name_safe \
-  get_space_org_names_safe simplify_buildpack_name extract_full_version \
-  csv_write_row csv_row csv_cell get_jre_version build_space_dev_cache
-export FOUNDATION_SLUG ENV_LOCATION ENV_TYPE ENV_DATACENTER BATCH_ID \
-       APP_DATA_OUT SERVICE_DATA_OUT DEVELOPER_DATA_OUT JAVA_RUNTIME_OUT \
-       AUDIT_EVENTS_OUT SERVICE_BINDINGS_OUT SPACE_DEVS_JSON_FILE
+# Wrapper used for per-app error handling in parallel workers
+APP_FAIL_FILE=""
 
-APPS_JSON_FILE="$WORK_DIR/apps.json"
-fetch_all_pages_v2 "/v2/apps" >"$APPS_JSON_FILE"
+process_app_wrapper() {
+  local app_json="$1"
 
-if ! jq -e . >/dev/null 2>&1 <"$APPS_JSON_FILE"; then
-  echo "cf curl /v2/apps did not return valid JSON. Are you logged in?" >&2
-  exit 5
-fi
+  local app_name app_guid
+  app_name=$(jq -r '.entity.name // "UNKNOWN_APP"'    <<<"$app_json" 2>/dev/null)
+  app_guid=$(jq -r '.metadata.guid // "UNKNOWN_GUID"' <<<"$app_json" 2>/dev/null)
 
-# Build the space → developers cache once up front (for app_data + dev csv)
-build_space_dev_cache
+  (
+    set -Eeuo pipefail
+    trap "$ORIGINAL_ERR_TRAP" ERR
+    process_app "$app_json"
+  )
+  local ec=$?
 
+  if [[ $ec -ne 0 ]]; then
+    {
+      echo "process_app failed for app ${app_name} (${app_guid}) on foundation ${FOUNDATION_SLUG} (exit ${ec})" >&2
+      [[ -n "$APP_FAIL_FILE" ]] && echo "fail" >>"$APP_FAIL_FILE"
+    } || true
+  fi
+
+  return 0
+}
+
+# Write normalized developer_space_data from the prebuilt SPACE_DEVS_JSON_FILE
 write_developer_space_data() {
   [[ -z "$DEVELOPER_DATA_OUT" ]] && return 0
 
@@ -1098,92 +1148,78 @@ write_developer_space_data() {
   done
 }
 
-APP_FAIL_FILE="$WORK_DIR/app_failures"
+###############################################################################
+# Phase runners
+###############################################################################
 
-process_app_wrapper() {
-  local app_json="$1"
+# Phase 1: per-app processing (app_data, service_data, java_runtime_data, audit_events)
+run_app_phase() {
+  APP_FAIL_FILE="$WORK_DIR/app_failures"
 
-  local app_name app_guid
-  app_name=$(jq -r '.entity.name // "UNKNOWN_APP"'    <<<"$app_json" 2>/dev/null)
-  app_guid=$(jq -r '.metadata.guid // "UNKNOWN_GUID"' <<<"$app_json" 2>/dev/null)
-
-  (
-    set -Eeuo pipefail
-    trap "$ORIGINAL_ERR_TRAP" ERR
-    process_app "$app_json"
-  )
-  local ec=$?
-
-  if [[ $ec -ne 0 ]]; then
-    {
-      echo "process_app failed for app ${app_name} (${app_guid}) on foundation ${FOUNDATION_SLUG} (exit ${ec})" >&2
-      echo "fail" >>"$APP_FAIL_FILE"
-    } || true
+  local workers="${WORKERS:-6}"
+  if ! [[ "$workers" =~ ^[1-9][0-9]*$ ]]; then
+    workers=1
   fi
 
-  return 0
+  echo "Processing apps (workers: $workers)..." >&2
+
+  # Disable global ERR trap inside this phase; we handle errors per-app
+  trap - ERR
+  set +e
+
+  if (( workers > 1 )); then
+    local current=0
+    declare -a pids=()
+    while IFS= read -r app; do
+      process_app_wrapper "$app" &
+      pids+=($!)
+      ((++current))
+      if (( current >= workers )); then
+        wait -n
+        ((--current))
+      fi
+    done < <(jq -c '.resources // [] | .[]' "$APPS_JSON_FILE")
+
+    for pid in "${pids[@]}"; do
+      wait "$pid" 2>/dev/null || true
+    done
+  else
+    while IFS= read -r app; do
+      process_app_wrapper "$app"
+    done < <(jq -c '.resources // [] | .[]' "$APPS_JSON_FILE")
+  fi
+
+  set -e
+  trap "$ORIGINAL_ERR_TRAP" ERR
+
+  if [[ -s "$APP_FAIL_FILE" ]]; then
+    echo "WARNING: One or more apps failed to process on foundation ${FOUNDATION_SLUG}. See ERROR lines above for details." >&2
+  fi
+
+  echo "Note: Developer_Count in app_data is per-app; developer_space_data provides normalized per-space records." >&2
 }
 
-workers="${WORKERS:-6}"
-if ! [[ "$workers" =~ ^[1-9][0-9]*$ ]]; then
-  workers=1
-fi
+# Phase 2: normalized Org/Space/Developer table, independent of per-app loops
+run_developer_space_phase() {
+  if [[ -n "${DEVELOPER_DATA_OUT:-}" ]]; then
+    write_developer_space_data
+  fi
+}
 
-echo "Processing apps (workers: $workers)..." >&2
+# Phase 3: service bindings (all brokers)
+run_service_bindings_phase() {
+  [[ -z "$SERVICE_BINDINGS_OUT" ]] && return 0
 
-trap - ERR
-set +e
-
-if (( workers > 1 )); then
-  current=0
-  declare -a pids=()
-  while IFS= read -r app; do
-    process_app_wrapper "$app" &
-    pids+=($!)
-    ((++current))
-    if (( current >= workers )); then
-      wait -n
-      ((--current))
-    fi
-  done < <(jq -c '.resources // [] | .[]' "$APPS_JSON_FILE")
-
-  for pid in "${pids[@]}"; do
-    wait "$pid" 2>/dev/null || true
-  done
-else
-  while IFS= read -r app; do
-    process_app_wrapper "$app"
-  done < <(jq -c '.resources // [] | .[]' "$APPS_JSON_FILE")
-fi
-
-set -e
-trap "$ORIGINAL_ERR_TRAP" ERR
-
-if [[ -s "$APP_FAIL_FILE" ]]; then
-  echo "WARNING: One or more apps failed to process on foundation ${FOUNDATION_SLUG}. See ERROR lines above for details." >&2
-fi
-
-echo "Note: Developer_Count in app_data is per-app; developer_space_data provides normalized per-space records." >&2
-
-if [[ -n "$DEVELOPER_DATA_OUT" ]]; then
-  write_developer_space_data
-fi
-
-###############################################################################
-# Service bindings (all brokers)
-###############################################################################
-
-if [[ -n "$SERVICE_BINDINGS_OUT" ]]; then
   echo "Collecting service binding data (all brokers)..." >&2
 
-  PULL_SERVICE_CREDENTIALS="${PULL_SERVICE_CREDENTIALS:-0}"
-
-  FETCH_CREDENTIAL_DETAILS=0
-  if [[ "$PULL_SERVICE_CREDENTIALS" == "1" ]]; then
+  local PULL_SERVICE_CREDENTIALS_LOCAL="${PULL_SERVICE_CREDENTIALS:-0}"
+  local FETCH_CREDENTIAL_DETAILS=0
+  if [[ "$PULL_SERVICE_CREDENTIALS_LOCAL" == "1" ]]; then
     FETCH_CREDENTIAL_DETAILS=1
   fi
   export FETCH_CREDENTIAL_DETAILS
 
+  # Helper to walk paginated v3 resources
   get_all() {
     local path="$1"
     {
@@ -1259,6 +1295,8 @@ if [[ -n "$SERVICE_BINDINGS_OUT" ]]; then
     ' | jq -s 'add'
   }
 
+  # jq templates for transforming broker data into flat binding rows
+  local app_jq_script
   app_jq_script=$(cat <<'JQAPP'
 def safe_name(m; k): (m[0][k]? | objects | .name?) // "N/A";
 def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
@@ -1294,6 +1332,7 @@ def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
 JQAPP
 )
 
+  local key_jq_script
   key_jq_script=$(cat <<'JQKEY'
 def safe_name(m; k): (m[0][k]? | objects | .name?) // "N/A";
 def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
@@ -1328,6 +1367,7 @@ def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
 JQKEY
 )
 
+  local unbound_jq_script
   unbound_jq_script=$(cat <<'JQUNB'
 def safe_name(m; k): (m[0][k]? | objects | .name?) // "N/A";
 def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
@@ -1475,6 +1515,7 @@ JQUNB
     printf '%s' "$app_bindings"   >"$app_bind_file"
     printf '%s' "$key_bindings"   >"$key_bind_file"
 
+    # App bindings
     jq -r \
       --arg BROKER "$broker_name" \
       --slurpfile OFFER "$offer_file" \
@@ -1497,6 +1538,7 @@ JQUNB
           "$FOUNDATION_SLUG" "$BATCH_ID"
       done
 
+    # Key bindings
     jq -r \
       --arg BROKER "$broker_name" \
       --slurpfile OFFER "$offer_file" \
@@ -1518,6 +1560,7 @@ JQUNB
           "$FOUNDATION_SLUG" "$BATCH_ID"
       done
 
+    # Unbound instances
     jq -r \
       --arg BROKER "$broker_name" \
       --slurpfile OFFER "$offer_file" \
@@ -1543,25 +1586,87 @@ JQUNB
     rm -rf "$tmpdir"
   }
 
-  export app_jq_script key_jq_script unbound_jq_script
   export -f get_all fetch_with_param_chunks parallel_get_objs parallel_get_binding_details_map \
             process_broker csv_write_row redact_credentials
 
+  local brokers_json
   brokers_json=$(fetch_all_pages_v3 "/v3/service_brokers")
   mapfile -t BROKER_GUIDS < <(jq -r '.[].guid // empty' <<<"$brokers_json")
 
-  BROKER_WORKERS="${BROKER_WORKERS:-3}"
+  local BROKER_WORKERS="${BROKER_WORKERS:-3}"
   if ((${#BROKER_GUIDS[@]})); then
     printf '%s\n' "${BROKER_GUIDS[@]}" \
       | xargs -n1 -P "$BROKER_WORKERS" bash -c 'process_broker "$1"' _
   fi
-fi
+}
 
-echo "Data collection complete." >&2
-echo "Output:" >&2
-echo "  app_data:             $APP_DATA_OUT" >&2
-[[ -n "$SERVICE_DATA_OUT" ]]     && echo "  service_data:         $SERVICE_DATA_OUT" >&2
-[[ -n "$DEVELOPER_DATA_OUT" ]]   && echo "  developer_space_data: $DEVELOPER_DATA_OUT" >&2
-[[ -n "$JAVA_RUNTIME_OUT" ]]     && echo "  java_runtime_data:    $JAVA_RUNTIME_OUT" >&2
-[[ -n "$AUDIT_EVENTS_OUT" ]]     && echo "  audit_events:         $AUDIT_EVENTS_OUT" >&2
-[[ -n "$SERVICE_BINDINGS_OUT" ]] && echo "  service_bindings:     $SERVICE_BINDINGS_OUT" >&2
+###############################################################################
+# main()
+###############################################################################
+
+main() {
+  echo "Foundation key: $FOUNDATION_KEY" >&2
+  echo "Environment:   $ENV_LOCATION / $ENV_TYPE / $ENV_DATACENTER" >&2
+  echo "Batch Id:      $BATCH_ID" >&2
+
+  # 1) Preload caches (buildpacks, spaces, orgs, stacks) + WORK_DIR
+  preload_foundation_metadata
+
+  # 2) Initialize output paths + write CSV headers
+  init_output_paths_and_headers
+
+  # Ensure these variables are exported so subshells (&, xargs) see them
+  export FOUNDATION_SLUG ENV_LOCATION ENV_TYPE ENV_DATACENTER BATCH_ID \
+         APP_DATA_OUT SERVICE_DATA_OUT DEVELOPER_DATA_OUT JAVA_RUNTIME_OUT \
+         AUDIT_EVENTS_OUT SERVICE_BINDINGS_OUT SPACE_DEVS_JSON_FILE WORK_DIR CACHE_ROOT ORCH_OUT_DIR
+
+  export -f process_app fetch_all_pages_v2 fetch_all_pages_v3 \
+            get_buildpack_filename get_version_info get_stack_name_safe \
+            get_space_org_names_safe simplify_buildpack_name extract_full_version \
+            csv_write_row csv_row csv_cell get_jre_version build_space_dev_cache \
+            process_app_wrapper write_developer_space_data run_app_phase \
+            run_developer_space_phase run_service_bindings_phase
+
+  # 3) Snapshot /v2/apps once to a local file for all phases
+  APPS_JSON_FILE="$WORK_DIR/apps.json"
+  export APPS_JSON_FILE
+
+  fetch_all_pages_v2 "/v2/apps" >"$APPS_JSON_FILE"
+
+  if ! jq -e . >/dev/null 2>&1 <"$APPS_JSON_FILE"; then
+    echo "cf curl /v2/apps did not return valid JSON. Are you logged in?" >&2
+    exit 5
+  fi
+
+  # 4) Build the space → developers cache up front
+  build_space_dev_cache
+
+  # 5) Run the three heavy phases in parallel:
+  #    - app inventory / audit events
+  #    - developer_space_data
+  #    - service bindings for all brokers
+  run_app_phase &
+  local pid_apps=$!
+
+  run_developer_space_phase &
+  local pid_devs=$!
+
+  run_service_bindings_phase &
+  local pid_bind=$!
+
+  # Wait for all phases to complete
+  wait "$pid_apps"  2>/dev/null || true
+  wait "$pid_devs"  2>/dev/null || true
+  wait "$pid_bind"  2>/dev/null || true
+
+  echo "Data collection complete." >&2
+  echo "Output:" >&2
+  echo "  app_data:             $APP_DATA_OUT" >&2
+  [[ -n "$SERVICE_DATA_OUT"     ]] && echo "  service_data:         $SERVICE_DATA_OUT" >&2
+  [[ -n "$DEVELOPER_DATA_OUT"   ]] && echo "  developer_space_data: $DEVELOPER_DATA_OUT" >&2
+  [[ -n "$JAVA_RUNTIME_OUT"     ]] && echo "  java_runtime_data:    $JAVA_RUNTIME_OUT" >&2
+  [[ -n "$AUDIT_EVENTS_OUT"     ]] && echo "  audit_events:         $AUDIT_EVENTS_OUT" >&2
+  [[ -n "$SERVICE_BINDINGS_OUT" ]] && echo "  service_bindings:     $SERVICE_BINDINGS_OUT" >&2
+}
+
+main "$@"
