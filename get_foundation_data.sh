@@ -58,7 +58,53 @@ OUTPUT_MODE="${CF_ORCH_DATA_MODE:-multi}"
 BASE_OUTPUT="${CF_ORCH_DATA_OUT:-./foundation_data}"
 
 # Foundation key used for env mapping (can be set from orchestrator)
-FOUNDATION_KEY="${CF_FOUNDATION:-${CF_ORCH_PLATFORM}}"
+# Priority:
+#   1) CF_FOUNDATION
+#   2) CF_ORCH_PLATFORM
+#   3) CF_API / cf target (derived from API endpoint host)
+#   4) "UNKNOWN_FOUNDATION"
+FOUNDATION_KEY="${CF_FOUNDATION:-${CF_ORCH_PLATFORM:-}}"
+
+if [[ -z "$FOUNDATION_KEY" ]]; then
+  # Try CF_API first (e.g. "https://api.system.fd-nonprod-chd.domain.com"
+  # or just "api.system.fd-nonprod-chd.domain.com")
+  api_endpoint="${CF_API:-}"
+
+  if [[ -z "$api_endpoint" ]]; then
+    # Fallback to `cf target` output; ignore errors
+    # Example line: "api endpoint:   https://api.system.fd-nonprod-chd.domain.com"
+    api_endpoint="$(cf target 2>/dev/null | awk '/api endpoint:/ {print $3}' || true)"
+  fi
+
+  if [[ -n "$api_endpoint" ]]; then
+    # Strip scheme if present; if not present, this is a no-op.
+    # "https://api.system.fd-nonprod-chd.domain.com" -> "api.system.fd-nonprod-chd.domain.com"
+    # "api.system.fd-nonprod-chd.domain.com"        -> "api.system.fd-nonprod-chd.domain.com"
+    api_host="${api_endpoint#*://}"
+
+    # Strip any path if present
+    # "api.system.fd-nonprod-chd.domain.com/v3" -> "api.system.fd-nonprod-chd.domain.com"
+    api_host="${api_host%%/*}"
+
+    # Drop leading "api." if present
+    # "api.system.fd-nonprod-chd.domain.com" -> "system.fd-nonprod-chd.domain.com"
+    api_host="${api_host#api.}"
+
+    # Drop leading "system." so we never end up with a foundation key of just "system"
+    # "system.fd-nonprod-chd.domain.com" -> "fd-nonprod-chd.domain.com"
+    api_host="${api_host#system.}"
+
+    # Only adopt it if we still have something non-empty
+    if [[ -n "$api_host" ]]; then
+      FOUNDATION_KEY="$api_host"
+    fi
+  fi
+fi
+
+# Absolute last resort if nothing was discovered
+if [[ -z "$FOUNDATION_KEY" ]]; then
+  FOUNDATION_KEY="UNKNOWN_FOUNDATION"
+fi
 
 # Batch tracking (can be provided externally)
 BATCH_ID="${BATCH_ID:-$(date +%Y%m%d_%H%M%S)}"
@@ -270,76 +316,80 @@ get_jre_version() {
   local bp_version="$1"
   local runtime_pref="$2"
 
-  [[ -z "$bp_version" || "$bp_version" == "null" ]] && { echo "Unknown"; return; }
+  # If we don't know the buildpack version, we can't reliably map to a JRE.
+  if [[ -z "$bp_version" || "$bp_version" == "null" ]]; then
+    echo "Unknown"
+    return
+  fi
 
-  # Normalize only "X.Y.0" → "X.Y". This does NOT turn 4.20 into 4.2.
+  # Normalise versions ending with ".0" (e.g. 4.20.0 → 4.20). This only
+  # affects lookup keys, not the reported buildpack version itself.
+  # NOTE: 4.20 stays 4.20; we NEVER turn 4.20 into 4.2.
   local normalized="$bp_version"
   if [[ "$bp_version" =~ ^([0-9]+\.[0-9]+)\.0$ ]]; then
     normalized="${BASH_REMATCH[1]}"
   fi
 
+  # Try to derive a Java major version from the runtime preference (e.g. "17.+").
+  # If nothing usable is found, default to 8 to mirror the Java buildpack's
+  # historic default behaviour.
   local major=""
   if [[ -n "$runtime_pref" && "$runtime_pref" != "null" ]]; then
-    if   [[ "$runtime_pref" =~ ^1\.([0-9]+) ]]; then
+    if [[ "$runtime_pref" =~ ^1\.([0-9]+) ]]; then
       major="${BASH_REMATCH[1]}"
     elif [[ "$runtime_pref" =~ ([0-9]+) ]]; then
       major="${BASH_REMATCH[1]}"
     fi
   fi
-
-  # Default behavior: when a developer does not specify a runtime, Java
-  # buildpacks choose Java 8. Mirror that here.
   if [[ -z "$major" ]]; then
     major="8"
   fi
 
   local lookup_key
 
-  # Helper: attempt lookup for a given version string + major
-  _lookup_jre_for_version_and_major() {
-    local ver="$1" maj="$2"
-    local key="${ver}:${maj}"
-    if [[ -n "${JRE_MAP[$key]:-}" ]]; then
-      echo "${JRE_MAP[$key]}"
-      return 0
-    fi
-    return 1
-  }
-
-  # 1) First try requested major with both original and normalized version
-  if _lookup_jre_for_version_and_major "$bp_version" "$major"; then
+  # 1. First try the exact/normalised buildpack version with the derived major.
+  lookup_key="${normalized}:${major}"
+  if [[ -n "${JRE_MAP[$lookup_key]:-}" ]]; then
+    echo "${JRE_MAP[$lookup_key]}"
     return
   fi
-  if [[ "$normalized" != "$bp_version" ]] && _lookup_jre_for_version_and_major "$normalized" "$major"; then
+  lookup_key="${bp_version}:${major}"
+  if [[ -n "${JRE_MAP[$lookup_key]:-}" ]]; then
+    echo "${JRE_MAP[$lookup_key]}"
     return
   fi
 
-  # 2) If requested major isn't 8, fall back to Java 8 for this buildpack version
+  # 2. If that fails and the requested major is not 8, fall back to Java 8 for
+  #    this buildpack version instead of silently upgrading to a newer major.
   if [[ "$major" != "8" ]]; then
-    if _lookup_jre_for_version_and_major "$bp_version" "8"; then
+    lookup_key="${normalized}:8"
+    if [[ -n "${JRE_MAP[$lookup_key]:-}" ]]; then
+      echo "${JRE_MAP[$lookup_key]}"
       return
     fi
-    if [[ "$normalized" != "$bp_version" ]] && _lookup_jre_for_version_and_major "$normalized" "8"; then
+    lookup_key="${bp_version}:8"
+    if [[ -n "${JRE_MAP[$lookup_key]:-}" ]]; then
+      echo "${JRE_MAP[$lookup_key]}"
       return
     fi
   fi
 
-  # 3) Last resort: fall back to the highest defined major for this buildpack
-  #    version. This is rarely hit and only when the lookup table is stale.
-  local highest_major=0
-  local highest_jre=""
+  # 3. As a last resort, return some reasonable Java 8 JRE from the table.
+  #    We deliberately NEVER fall back to a higher major here.
+  local fallback_8=""
   local key
   for key in "${!JRE_MAP[@]}"; do
-    if [[ "$key" == "${normalized}:"* || "$key" == "${bp_version}:"* ]]; then
-      local curr="${key##*:}"
-      if [[ "$curr" -gt "$highest_major" ]]; then
-        highest_major="$curr"
-        highest_jre="${JRE_MAP[$key]}"
-      fi
+    if [[ "$key" == *":8" ]]; then
+      fallback_8="${JRE_MAP[$key]}"
+      break
     fi
   done
 
-  [[ -n "$highest_jre" ]] && echo "$highest_jre" || echo "Unknown"
+  if [[ -n "$fallback_8" ]]; then
+    echo "$fallback_8"
+  else
+    echo "Unknown"
+  fi
 }
 
 ###############################################################################
