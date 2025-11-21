@@ -75,6 +75,7 @@ FOUNDATION_SLUG="${CF_ORCH_PLATFORM:-${FOUNDATION_SLUG:-$FOUNDATION_KEY}}"
 
 # Organisations to exclude from audit event collection
 IGNORE_ORGS=("system" "p-spring-cloud-services" "Platform-Operations" "splunk-nozzle-org")
+
 # Audit event types to retain for KPI reporting
 KPI_EVENT_TYPES=(
   "audit.app.crash"          # v3 crash event
@@ -201,25 +202,18 @@ JRE_MAP["4.32.1:8"]="1.8.0_265"; JRE_MAP["4.32.1:11"]="11.0.8_10"; JRE_MAP["4.32
 
 # Recent v4.58+
 for v in 4.58 4.59.0 4.60.0; do
-  # Versions prior to 4.64.0 only support Java 8, 11 and 17.  They do not
-  # include a Java 21 entry in the JRE lookup table.  See JRE.js for
-  # reference.
   JRE_MAP["$v:8"]="1.8.0_372"
   JRE_MAP["$v:11"]="11.0.19_7"
   JRE_MAP["$v:17"]="17.0.7_7"
 done
 
 for v in 4.61.0 4.61.1 4.62.0; do
-  # Versions 4.61.x only support Java 8, 11 and 17.  There is no Java 21
-  # entry for these buildpacks.
   JRE_MAP["$v:8"]="1.8.0_382"
   JRE_MAP["$v:11"]="11.0.20_8"
   JRE_MAP["$v:17"]="17.0.8_7"
 done
 
 for v in 4.63.0 4.63.1; do
-  # Versions 4.63.x only support Java 8, 11 and 17.  There is no Java 21
-  # entry for these buildpacks.
   JRE_MAP["$v:8"]="1.8.0_392"
   JRE_MAP["$v:11"]="11.0.21_10"
   JRE_MAP["$v:17"]="17.0.9_11"
@@ -288,8 +282,6 @@ get_jre_version() {
 
   local major=""
   if [[ -n "$runtime_pref" && "$runtime_pref" != "null" ]]; then
-    # If the preference is in the form 1.x (e.g. 1.8) then the effective
-    # major version is x.  Otherwise extract the leading numeric portion.
     if [[ "$runtime_pref" =~ ^1\.([0-9]+) ]]; then
       major="${BASH_REMATCH[1]}"
     elif [[ "$runtime_pref" =~ ([0-9]+) ]]; then
@@ -304,8 +296,6 @@ get_jre_version() {
     major="8"
   fi
 
-  # Attempt to look up an exact mapping for the normalized or full buildpack version
-  # combined with the chosen major.  Prefer the normalized version (strip trailing .0)
   local lookup_key
   lookup_key="${normalized}:${major}"
   if [[ -n "${JRE_MAP[$lookup_key]:-}" ]]; then
@@ -318,8 +308,6 @@ get_jre_version() {
     return
   fi
 
-  # If no direct mapping exists (very unlikely), fall back to the highest
-  # defined major for this buildpack version.
   local highest_major=0
   local highest_jre=""
   local key
@@ -339,23 +327,22 @@ get_jre_version() {
 ###############################################################################
 # Credential Redaction
 #
-# By default, the script redacts all service credential URIs and JSON payloads
-# when producing the service_bindings.csv. This behaviour is controlled by the
-# environment variable CF_ORCH_REDACT_CREDENTIALS. When set to any value other
-# than "0", redaction is enabled and any non-empty credential field will be
-# replaced with the literal string "[REDACTED]". To disable redaction and
-# include the full credential values, set CF_ORCH_REDACT_CREDENTIALS=0 before
-# running the script.
+# CF_ORCH_REDACT_CREDENTIALS:
+#   - default: redact everything (non-empty → "[REDACTED]")
+#   - set CF_ORCH_REDACT_CREDENTIALS=0 to write raw values
 #
+# PULL_SERVICE_CREDENTIALS:
+#   - default: 0 → we never call /v3/service_credential_bindings/*/details
+#                (credential_uri / credentials_json columns stay empty)
+#   - set PULL_SERVICE_CREDENTIALS=1 → call /details and then redaction
+#     rules apply as above.
 ###############################################################################
 
 redact_credentials() {
   local value="$1"
-  # If CF_ORCH_REDACT_CREDENTIALS is explicitly set to "0", return the original value.
   if [[ "${CF_ORCH_REDACT_CREDENTIALS:-1}" == "0" ]]; then
     printf '%s' "$value"
   else
-    # When redacting, preserve empties; otherwise emit a constant marker.
     if [[ -z "$value" ]]; then
       printf '%s' ""
     else
@@ -367,10 +354,6 @@ export -f redact_credentials
 
 ###############################################################################
 # CSV Helpers
-#
-# The helper functions below provide simple CSV cell and row formatting, as well
-# as atomic write operations with file locking. These are used throughout the
-# script to reliably construct the output CSV files.
 ###############################################################################
 
 csv_cell() {
@@ -426,9 +409,6 @@ export -f csv_cell csv_row csv_write_header csv_write_row
 
 ###############################################################################
 # Buildpack Helpers
-#
-# A collection of helper functions to simplify buildpack names, extract version
-# information from buildpack filenames, and perform other lookup operations.
 ###############################################################################
 
 simplify_buildpack_name() {
@@ -454,17 +434,9 @@ simplify_buildpack_name() {
 extract_full_version() {
   local filename="$1"
   [[ -z "$filename" || "$filename" == "null" ]] && { echo ""; return; }
-  # Extract the semantic version portion of a buildpack filename following the JavaScript logic in Utilities.js.
-  # It looks for '-vX.Y' with an optional third component and optional pre-release/build suffixes.
-  # Example matches: java-buildpack-v4.70.0.zip -> 4.70.0
-  #                  java-buildpack-v4.9.zip    -> 4.9
-  #                  java-buildpack-v4.64.0-alpha -> 4.64.0-alpha
-  #                  java-buildpack-v4.66.0+build -> 4.66.0+build
-  # The plus sign must be escaped in bash regex to match a literal plus.  Without escaping, it becomes a quantifier and causes the entire pattern to fail.
   if [[ "$filename" =~ -v([0-9]+\.[0-9]+(?:\.[0-9]+)?(?:-[[:alnum:]._-]+)?(?:\+[[:alnum:]._-]+)?) ]]; then
     echo "${BASH_REMATCH[1]}"
   else
-    # Fallback: search for the first dotted numeric pattern like 4.70.0 or 4.58 in the filename
     local fallback
     fallback=$(echo "$filename" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1 || true)
     echo "$fallback"
@@ -473,10 +445,6 @@ extract_full_version() {
 
 ###############################################################################
 # Pagination Helpers
-#
-# Helper functions to fetch paginated results from the CF API across both v2 and
-# v3 endpoints. These utilities ensure that all pages of data are retrieved
-# in a single call.
 ###############################################################################
 
 fetch_all_pages_v2() {
@@ -526,10 +494,6 @@ fetch_all_pages_v3() {
 
 ###############################################################################
 # Cache Setup
-#
-# Prepare on-disk caches for expensive API calls such as buildpacks, spaces,
-# organizations and stacks. These caches are keyed by the foundation and avoid
-# repeated API hits when the script is executed multiple times.
 ###############################################################################
 
 ORCH_OUT_DIR="${CF_ORCH_OUT_DIR:-$PWD/outputs}"
@@ -549,9 +513,10 @@ BUILDPACKS_JSON_FILE="$CACHE_ROOT/buildpacks.json"
 SPACES_JSON_FILE="$CACHE_ROOT/spaces.json"
 ORGS_JSON_FILE="$CACHE_ROOT/orgs.json"
 STACKS_JSON_FILE="$CACHE_ROOT/stacks.json"
+SPACE_DEVS_JSON_FILE="$CACHE_ROOT/space_developers.json"
 
 export ORCH_OUT_DIR CACHE_ROOT WORK_DIR \
-       BUILDPACKS_JSON_FILE SPACES_JSON_FILE ORGS_JSON_FILE STACKS_JSON_FILE
+       BUILDPACKS_JSON_FILE SPACES_JSON_FILE ORGS_JSON_FILE STACKS_JSON_FILE SPACE_DEVS_JSON_FILE
 
 echo "Preloading foundation metadata..." >&2
 
@@ -572,13 +537,69 @@ fetch_all_pages_v2 "/v2/stacks" >"$tmp_stacks" || echo '{"resources":[]}' >"$tmp
 mv -f "$tmp_stacks" "$STACKS_JSON_FILE"
 
 ###############################################################################
-# Lookups
-#
-# A set of helper functions that perform lookups against cached data or the CF
-# API to determine buildpack filenames, version information, stack names,
-# organization/space names and more. These functions abstract away the details
-# of the underlying API structure and caching mechanics.
+# Lookups & Developer Cache
 ###############################################################################
+
+build_space_dev_cache() {
+  local out="$SPACE_DEVS_JSON_FILE"
+  local tmp; tmp="$(mktemp "${CACHE_ROOT%/}/.space_devs.tmp.XXXXXX")"
+
+  mapfile -t space_urls < <(
+    jq -r '.resources[]?.entity.space_url // empty' "$APPS_JSON_FILE" | sort -u
+  )
+
+  if ((${#space_urls[@]} == 0)); then
+    echo '{}' >"$tmp"
+    mv -f "$tmp" "$out"
+    return
+  fi
+
+  echo "Preloading developers for ${#space_urls[@]} spaces..." >&2
+
+  local td; td="$(mktemp -d "${CACHE_ROOT%/}/.space_devs_parts.XXXXXX")"
+  local workers="${SPACE_DEV_WORKERS:-8}"
+  if ! [[ "$workers" =~ ^[1-9][0-9]*$ ]]; then
+    workers=4
+  fi
+
+  local current=0
+  declare -a pids=()
+
+  for url in "${space_urls[@]}"; do
+    (
+      sg="${url##*/}"
+      devs=$(
+        cf curl "${url}/developers" 2>/dev/null \
+          | jq -r '.resources[]?.entity.username // empty' \
+          | awk 'NF' \
+          | paste -sd ':' - \
+          || true
+      )
+      jq -n --arg gid "$sg" --arg devs "$devs" '{ ($gid): $devs }' \
+        >"$td/${sg}.json"
+    ) &
+    pids+=($!)
+    ((++current))
+    if (( current >= workers )); then
+      wait -n 2>/dev/null || true
+      ((--current))
+    fi
+  done
+
+  for pid in "${pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+
+  if compgen -G "$td/*.json" >/dev/null 2>&1; then
+    jq -s 'reduce .[] as $o ({}; . * $o)' "$td"/*.json >"$tmp" 2>/dev/null \
+      || echo '{}' >"$tmp"
+  else
+    echo '{}' >"$tmp"
+  fi
+
+  rm -rf "$td"
+  mv -f "$tmp" "$out"
+}
 
 get_buildpack_filename() {
   local bp_key="$1" stack_name="${2:-}" out=""
@@ -601,9 +622,6 @@ get_buildpack_filename() {
   if [[ -z "$out" && "$bp_key" =~ ^[0-9a-fA-F-]{36}$ ]]; then
     out=$(cf curl "/v2/buildpacks/$bp_key" 2>/dev/null | jq -r '.entity.filename // empty')
   fi
-
-  # If still not found and bp_key is a name rather than a GUID, attempt a remote lookup by name.
-  # Some buildpacks may not be present in the cached buildpacks.json; query the API directly.
   if [[ -z "$out" && -n "$bp_key" && ! "$bp_key" =~ ^[0-9a-fA-F-]{36}$ ]]; then
     local resp
     resp=$(cf curl "/v2/buildpacks?q=name:${bp_key}" 2>/dev/null || echo '{}')
@@ -620,30 +638,18 @@ get_version_info() {
   env_data=$(cf curl "/v2/apps/${app_guid}/env" 2>/dev/null || echo '{}')
   buildpack_version=$(jq -r '.staging_env_json.BUILDPACK_VERSION // empty' <<<"$env_data")
 
-  # Determine runtime_version based on language.  For Java, look at both
-  # staging_env_json and environment_json JBP_CONFIG_OPEN_JDK_JRE.  Fall back
-  # to JAVA_VERSION if present.  For other languages, use their respective
-  # environment variables.  We intentionally preserve the original runtime
-  # string (e.g. "17.+") rather than collapsing to just the digits here.  The
-  # get_jre_version() function will extract the major version as needed.
   if [[ "$detected_buildpack" =~ [Jj]ava ]]; then
-    # Try to find a JRE config in staging or environment JSON
     local jre_cfg=""
     jre_cfg=$(jq -r '.environment_json.JBP_CONFIG_OPEN_JDK_JRE // .staging_env_json.JBP_CONFIG_OPEN_JDK_JRE // empty' <<<"$env_data")
     if [[ -z "$jre_cfg" || "$jre_cfg" == "null" ]]; then
-      # Fall back to JAVA_VERSION or similar
       jre_cfg=$(jq -r '.environment_json.JAVA_VERSION // .staging_env_json.JAVA_VERSION // empty' <<<"$env_data")
     fi
-    # Extract just the version string if the config appears to be a JSON object
-    # e.g. '{ "jre": { "version": "17.+" }}' -> '17.+'
     if [[ "$jre_cfg" =~ \{ ]]; then
-      # Attempt to parse as JSON and extract .jre.version; if that fails, leave empty
       local extracted=""
       extracted=$(printf '%s' "$jre_cfg" | sed 's/\([a-zA-Z_][a-zA-Z0-9_]*\):/"\1":/g' | sed 's/: \([0-9][^,} ]*\)/: "\1"/g' | jq -r 'try .jre.version // empty' 2>/dev/null || true)
       if [[ -n "$extracted" ]]; then
         runtime_version="$extracted"
       else
-        # Not a standard JSON; fallback to first numeric pattern like '17.+' or '17'
         runtime_version=$(echo "$jre_cfg" | grep -oE '[0-9]+(\.[0-9]+)?\+?' | head -n1 || true)
       fi
     else
@@ -692,8 +698,6 @@ get_space_org_names_safe() {
 
 ###############################################################################
 # Output Setup
-#
-# Prepare output paths and write CSV headers based on the selected output mode.
 ###############################################################################
 
 if [[ "$OUTPUT_MODE" == "multi" ]]; then
@@ -716,9 +720,6 @@ fi
 
 ###############################################################################
 # Initialize CSV Files
-#
-# Define column headers for each CSV and write them out if the file is empty or
-# if CF_ORCH_FORCE_HEADER is set.
 ###############################################################################
 
 echo "Initializing output files..." >&2
@@ -767,22 +768,15 @@ BINDINGS_HEADER=(
 )
 
 csv_write_header "$APP_DATA_OUT"        "${APP_HEADER[@]}"
-[[ -n "$SERVICE_DATA_OUT" ]]    && csv_write_header "$SERVICE_DATA_OUT"    "${SERVICE_HEADER[@]}"
-[[ -n "$DEVELOPER_DATA_OUT" ]]  && csv_write_header "$DEVELOPER_DATA_OUT"  "${DEVELOPER_HEADER[@]}"
-[[ -n "$JAVA_RUNTIME_OUT" ]]    && csv_write_header "$JAVA_RUNTIME_OUT"    "${JAVA_HEADER[@]}"
-[[ -n "$AUDIT_EVENTS_OUT" ]]    && csv_write_header "$AUDIT_EVENTS_OUT"    "${EVENTS_HEADER[@]}"
+[[ -n "$SERVICE_DATA_OUT" ]]     && csv_write_header "$SERVICE_DATA_OUT"    "${SERVICE_HEADER[@]}"
+[[ -n "$DEVELOPER_DATA_OUT" ]]   && csv_write_header "$DEVELOPER_DATA_OUT"  "${DEVELOPER_HEADER[@]}"
+[[ -n "$JAVA_RUNTIME_OUT" ]]     && csv_write_header "$JAVA_RUNTIME_OUT"    "${JAVA_HEADER[@]}"
+[[ -n "$AUDIT_EVENTS_OUT" ]]     && csv_write_header "$AUDIT_EVENTS_OUT"    "${EVENTS_HEADER[@]}"
 [[ -n "$SERVICE_BINDINGS_OUT" ]] && csv_write_header "$SERVICE_BINDINGS_OUT" "${BINDINGS_HEADER[@]}"
 
 ###############################################################################
-# Process App Data
-#
-# The process_app function handles per-app logic to generate rows for the app
-# inventory as well as service data, developer data, Java runtime data, and
-# audit events. It is designed to be called concurrently to speed up
-# processing across a large number of applications.
+# App processing
 ###############################################################################
-
-declare -A SPACE_DEV_SEEN
 
 process_app() {
   local app="$1"
@@ -804,13 +798,13 @@ process_app() {
     cf curl -X HEAD -v "$dl" 2>&1 \
       | awk -F': ' '/Content-Length:/ {gsub(/\r/,"",$2); print $2; exit}' \
     || true
-    ))
+  ))
 
   [[ -n "$pl" ]] && packages_size_bytes=$( (
     cf curl -X HEAD -v "$pl" 2>&1 \
       | awk -F': ' '/Content-Length:/ {gsub(/\r/,"",$2); print $2; exit}' \
     || true
-    ))
+  ))
 
   local health_check app_state
   health_check=$(jq -r '.entity.health_check_type // empty' <<<"$app")
@@ -840,8 +834,6 @@ process_app() {
   fi
 
   local buildpack_version runtime_version
-  # Retrieve any explicit buildpack and runtime versions from the app's staging/env metadata.
-  # get_version_info echoes two fields separated by a pipe: BUILD PACK VERSION and runtime preference.
   IFS='|' read -r buildpack_version runtime_version <<<"$(get_version_info "$app_guid" "$detected_buildpack" "$buildpack_filename")"
 
   local auto_state="NotFound"
@@ -878,7 +870,6 @@ process_app() {
     extracted_version=$(extract_full_version "$buildpack_filename")
   fi
   [[ -z "$extracted_version" && -n "$buildpack_version" ]] && extracted_version="$buildpack_version"
-  # Fallback: extract version directly from buildpack or detected buildpack names if still empty
   if [[ -z "$extracted_version" ]]; then
     if [[ "$buildpack" =~ ([0-9]+\.[0-9]+(\.[0-9]+)?) ]]; then
       extracted_version="${BASH_REMATCH[1]}"
@@ -887,41 +878,15 @@ process_app() {
     fi
   fi
 
-  # ---------------------------------------------------------------------
-  # Prefer the extracted version from the buildpack filename or name over
-  # the value obtained from BUILDPACK_VERSION in the app's staging env.
-  # The JSON environment value is often a bare number (e.g. 4.20 becomes
-  # 4.2) which causes truncation of trailing zeros.  To avoid this
-  # ambiguity, we always overwrite buildpack_version with the more
-  # accurate extracted_version when it is available.
   if [[ -n "$extracted_version" ]]; then
     buildpack_version="$extracted_version"
   fi
 
-  # ---------------------------------------------------------------
-  # At this point, extracted_version holds the buildpack version, and
-  # runtime_version holds the version preference (e.g. "17.+").  In
-  # some environments these may remain empty.  To ensure the
-  # java_runtime_data.csv always contains a non-empty Buildpack_Version
-  # and Runtime_Version field, set them to "Unknown" if missing.  Use
-  # temporary variables for output so as not to interfere with
-  # subsequent logic (e.g. computing jre_version).
   local bp_version_field="$extracted_version"
-  if [[ -z "$bp_version_field" ]]; then
-    bp_version_field="Unknown"
-  fi
-  # Preserve the original runtime version (which may be blank) for the
-  # java_runtime_data.csv output.  Do not replace a blank runtime
-  # preference with "Unknown" here; leaving it blank indicates the
-  # developer did not specify a runtime version.  We still keep
-  # runtime_version for computing the JRE lookup.
+  [[ -z "$bp_version_field" ]] && bp_version_field="Unknown"
   local runtime_version_field="$runtime_version"
 
   local jre_version=""
-  # Compute JRE version for Java apps.  We consider any grouped buildpack containing
-  # the substring "java" (case-insensitive) to be a Java application.  If a
-  # runtime version is provided, it will be used to select the corresponding JRE
-  # version; otherwise the highest available JRE for the buildpack will be returned.
   if [[ "$grouped_buildpack" =~ [Jj]ava ]]; then
     jre_version=$(get_jre_version "$extracted_version" "$runtime_version")
   fi
@@ -929,8 +894,6 @@ process_app() {
   local total_bytes=0
   [[ -n "$droplet_size_bytes" && "$droplet_size_bytes" =~ ^[0-9]+$ ]] && ((total_bytes += droplet_size_bytes))
   [[ -n "$packages_size_bytes" && "$packages_size_bytes" =~ ^[0-9]+$ ]] && ((total_bytes += packages_size_bytes))
-  # We report total package/droplet size in raw bytes rather than converting
-  # to megabytes.  The user prefers byte units.
   local est_bytes=""
   [[ $total_bytes -gt 0 ]] && est_bytes="$total_bytes"
 
@@ -945,14 +908,12 @@ process_app() {
     service_guid=$(jq -r '.guid // empty' <<<"$svc")
     [[ -z "$service_guid" || "$service_guid" == "null" ]] && continue
     service_type=$(jq -r '.type // empty' <<<"$svc")
-    # Capture the developer-assigned service instance name for all service types
     svc_name=$(jq -r '.name // ""' <<<"$svc")
     if [[ "$service_type" != "user_provided_service_instance" ]]; then
       label=$(jq -r '.service_plan.service.label // ""' <<<"$svc")
       plan=$(jq -r  '.service_plan.name // ""' <<<"$svc")
       service_string="$label ($plan)-($service_guid)"
     else
-      # For user provided services, the plan is the service name and the label is fixed
       label="User Provided Service"
       plan="$svc_name"
       service_string="$svc_name (user provided service)-($service_guid)"
@@ -973,38 +934,17 @@ process_app() {
     service_count=${#services_list[@]}
   fi
 
-  # ------------------------ developers & developer_space_data ------------------------
-  local dev_usernames
-  dev_usernames=$(cf curl "${space_url}/developers" 2>/dev/null \
-    | jq -r '.resources // [] | .[] | .entity | select(.username != null) | .username' \
-    | paste -sd ':' -)
-
-  if [[ -n "$DEVELOPER_DATA_OUT" && -n "$dev_usernames" ]]; then
-    IFS=':' read -ra devs <<<"$dev_usernames"
-    local dev
-    for dev in "${devs[@]}"; do
-      dev="${dev,,}"
-      [[ -z "$dev" ]] && continue
-      local key="${stable_key}||${BATCH_ID}||${dev}"
-      if [[ -n "${SPACE_DEV_SEEN[$key]:-}" ]]; then
-        continue
-      fi
-      SPACE_DEV_SEEN["$key"]=1
-      csv_write_row "$DEVELOPER_DATA_OUT" \
-        "$stable_key" "$FOUNDATION_SLUG" "$org_name" "$space_name" \
-        "$ENV_LOCATION" "$ENV_TYPE" "$ENV_DATACENTER" \
-        "$dev" "$BATCH_ID"
-    done
+  # ------------------------ developers (from space cache) ------------------------
+  local dev_usernames=""
+  if [[ -s "$SPACE_DEVS_JSON_FILE" ]]; then
+    local space_guid="${space_url##*/}"
+    dev_usernames=$(jq -r --arg gid "$space_guid" '.[$gid] // ""' "$SPACE_DEVS_JSON_FILE")
   fi
 
   # ------------------------ java_runtime_data ------------------------
-  # Always write a Java runtime data row for apps identified as using a Java buildpack.
-  # Use fallback values of "Unknown" for missing buildpack or runtime version info.
   if [[ -n "$JAVA_RUNTIME_OUT" && "$grouped_buildpack" =~ [Jj]ava ]]; then
     local bp_ver_out="$bp_version_field"
     [[ -z "$bp_ver_out" ]] && bp_ver_out="Unknown"
-    # For the runtime version column, leave it blank if the developer did not
-    # specify one.  We do not fill in "Unknown" here.
     local rt_ver_out="$runtime_version_field"
     local jr_ver_out="$jre_version"
     [[ -z "$jr_ver_out" ]] && jr_ver_out="Unknown"
@@ -1014,14 +954,8 @@ process_app() {
       "$FOUNDATION_SLUG" "$BATCH_ID"
   fi
 
-  # ------------------------ audit events (paginated) ------------------------
-  local events=""
+  # ------------------------ audit events ------------------------
   local events_json="[]"
-
-  # Determine whether to collect audit events based on the org.  When
-  # ORG_FILTER_ENABLED=1 (default), skip collection if the app belongs to an
-  # organisation in the IGNORE_ORGS list.  When ORG_FILTER_ENABLED=0, no
-  # org-based skipping is applied.
   local skip_audit="false"
   if [[ "$ORG_FILTER_ENABLED" == "1" ]]; then
     for ignore_org in "${IGNORE_ORGS[@]}"; do
@@ -1033,43 +967,34 @@ process_app() {
   fi
 
   if [[ "$skip_audit" == "false" && -n "$AUDIT_EVENTS_OUT" ]]; then
-    # Fetch all audit events for this app
     events_json="$(fetch_all_pages_v3 "/v3/audit_events?target_guids=${app_guid}")"
-    # Optionally filter events down to KPI-relevant types when KPI_FILTER_ENABLED=1
     if [[ "$KPI_FILTER_ENABLED" == "1" && "$(jq 'length' <<<"$events_json")" -gt 0 ]]; then
-      # Build a jq boolean expression from KPI_EVENT_TYPES
       local kpi_expr=""
       local _evt
       for _evt in "${KPI_EVENT_TYPES[@]}"; do
         kpi_expr+=".type == \"${_evt}\" or "
       done
-      # Trim the trailing ' or '
       kpi_expr="${kpi_expr% or }"
       events_json="$(jq -c "[.[] | select(${kpi_expr})]" <<<"$events_json")"
     fi
   fi
 
-  # If no events remain or collection was skipped, ensure events_json is an empty array
   [[ -z "$events_json" || "$events_json" == "null" ]] && events_json="[]"
 
-  # Write filtered audit events (if any)
-  if [[ "$(jq 'length' <<<"$events_json")" -gt 0 ]]; then
-    if [[ -n "$AUDIT_EVENTS_OUT" ]]; then
-      while IFS= read -r event; do
-        local event_type actor actor_type actor_name ts meta
-        event_type="$(jq -r '.type // ""'           <<<"$event")"
-        actor="$(jq -r      '.actor.guid // ""'     <<<"$event")"
-        actor_type="$(jq -r '.actor.type // ""'     <<<"$event")"
-        actor_name="$(jq -r '.actor.name // ""'     <<<"$event")"
-        ts="$(jq -r         '.created_at // ""'     <<<"$event")"
-        meta="$(jq -c       '.data // {}'           <<<"$event")"
+  if [[ "$(jq 'length' <<<"$events_json")" -gt 0 && -n "$AUDIT_EVENTS_OUT" ]]; then
+    while IFS= read -r event; do
+      local event_type actor actor_type actor_name ts meta
+      event_type="$(jq -r '.type // ""'           <<<"$event")"
+      actor="$(jq -r      '.actor.guid // ""'     <<<"$event")"
+      actor_type="$(jq -r '.actor.type // ""'     <<<"$event")"
+      actor_name="$(jq -r '.actor.name // ""'     <<<"$event")"
+      ts="$(jq -r         '.created_at // ""'     <<<"$event")"
+      meta="$(jq -c       '.data // {}'           <<<"$event")"
 
-        csv_write_row "$AUDIT_EVENTS_OUT" \
-          "$app_guid" "$name" "$event_type" "$actor" "$actor_type" "$actor_name" \
-          "$ts" "$meta" "$FOUNDATION_SLUG" "$BATCH_ID"
-      done < <(jq -c '.[]' <<<"$events_json")
-    fi
-    events="$(jq -cr '.[]?' <<<"$events_json" | paste -sd ':#:' -)"
+      csv_write_row "$AUDIT_EVENTS_OUT" \
+        "$app_guid" "$name" "$event_type" "$actor" "$actor_type" "$actor_name" \
+        "$ts" "$meta" "$FOUNDATION_SLUG" "$BATCH_ID"
+    done < <(jq -c '.[]' <<<"$events_json")
   fi
 
   # ------------------------ developer count ------------------------
@@ -1092,10 +1017,10 @@ process_app() {
 export -f process_app fetch_all_pages_v2 fetch_all_pages_v3 \
   get_buildpack_filename get_version_info get_stack_name_safe \
   get_space_org_names_safe simplify_buildpack_name extract_full_version \
-  csv_write_row csv_row csv_cell get_jre_version
+  csv_write_row csv_row csv_cell get_jre_version build_space_dev_cache
 export FOUNDATION_SLUG ENV_LOCATION ENV_TYPE ENV_DATACENTER BATCH_ID \
        APP_DATA_OUT SERVICE_DATA_OUT DEVELOPER_DATA_OUT JAVA_RUNTIME_OUT \
-       AUDIT_EVENTS_OUT SERVICE_BINDINGS_OUT
+       AUDIT_EVENTS_OUT SERVICE_BINDINGS_OUT SPACE_DEVS_JSON_FILE
 
 APPS_JSON_FILE="$WORK_DIR/apps.json"
 fetch_all_pages_v2 "/v2/apps" >"$APPS_JSON_FILE"
@@ -1105,71 +1030,123 @@ if ! jq -e . >/dev/null 2>&1 <"$APPS_JSON_FILE"; then
   exit 5
 fi
 
-# Global flag we can use to know if any app failed
-overall_status=0
+# Build the space → developers cache once up front (for app_data + dev csv)
+build_space_dev_cache
+
+write_developer_space_data() {
+  [[ -z "$DEVELOPER_DATA_OUT" ]] && return 0
+
+  if [[ ! -s "$SPACE_DEVS_JSON_FILE" ]]; then
+    echo "No space developer cache found at $SPACE_DEVS_JSON_FILE; skipping developer_space_data." >&2
+    return 0
+  fi
+
+  echo "Building developer_space_data from cached space developers..." >&2
+
+  declare -A SPACE_DEV_SEEN_LOCAL
+
+  mapfile -t space_urls < <(
+    jq -r '.resources[]?.entity.space_url // empty' "$APPS_JSON_FILE" | sort -u
+  )
+
+  local space_url space_guid space_name org_guid org_name devs dev key stable_key
+
+  for space_url in "${space_urls[@]}"; do
+    space_guid="${space_url##*/}"
+    [[ -z "$space_guid" || "$space_guid" == "null" ]] && continue
+
+    devs=$(jq -r --arg gid "$space_guid" '.[$gid] // ""' "$SPACE_DEVS_JSON_FILE")
+    [[ -z "$devs" ]] && continue
+
+    space_name=$(jq -r --arg gid "$space_guid" \
+      '.resources[]? | select(.metadata.guid == $gid) | .entity.name // empty' \
+      "$SPACES_JSON_FILE")
+
+    org_guid=$(jq -r --arg gid "$space_guid" \
+      '.resources[]? | select(.metadata.guid == $gid) | .entity.organization_guid // empty' \
+      "$SPACES_JSON_FILE")
+
+    org_name=""
+    if [[ -n "$org_guid" && "$org_guid" != "null" ]]; then
+      if [[ -s "$ORGS_JSON_FILE" ]]; then
+        org_name=$(jq -r --arg og "$org_guid" \
+          '.resources[]? | select(.metadata.guid == $og) | .entity.name // empty' \
+          "$ORGS_JSON_FILE")
+      fi
+      if [[ -z "$org_name" ]]; then
+        org_name=$(cf curl "/v2/organizations/$org_guid" 2>/dev/null | jq -r '.entity.name // empty')
+      fi
+    fi
+
+    stable_key="${FOUNDATION_SLUG}:${org_name}:${space_name}"
+
+    IFS=':' read -ra dev_arr <<<"$devs"
+    for dev in "${dev_arr[@]}"; do
+      dev="${dev,,}"
+      [[ -z "$dev" ]] && continue
+      key="${stable_key}||${BATCH_ID}||${dev}"
+      if [[ -n "${SPACE_DEV_SEEN_LOCAL[$key]:-}" ]]; then
+        continue
+      fi
+      SPACE_DEV_SEEN_LOCAL["$key"]=1
+
+      csv_write_row "$DEVELOPER_DATA_OUT" \
+        "$stable_key" "$FOUNDATION_SLUG" "$org_name" "$space_name" \
+        "$ENV_LOCATION" "$ENV_TYPE" "$ENV_DATACENTER" \
+        "$dev" "$BATCH_ID"
+    done
+  done
+}
+
+APP_FAIL_FILE="$WORK_DIR/app_failures"
 
 process_app_wrapper() {
   local app_json="$1"
 
-  # Extract some ID info for logging
   local app_name app_guid
   app_name=$(jq -r '.entity.name // "UNKNOWN_APP"'    <<<"$app_json" 2>/dev/null)
   app_guid=$(jq -r '.metadata.guid // "UNKNOWN_GUID"' <<<"$app_json" 2>/dev/null)
 
-  # Run process_app in a subshell with its own strict mode + trap
   (
     set -Eeuo pipefail
-
-    err_local() {
-      local ec=$?
-      echo "ERROR: process_app failed for app ${app_name} (${app_guid}) on foundation ${FOUNDATION_SLUG} (exit ${ec})" >&2
-      # exit non-zero so the parent wrapper can see that it failed
-      exit "$ec"
-    }
-
     trap "$ORIGINAL_ERR_TRAP" ERR
-
     process_app "$app_json"
   )
   local ec=$?
 
-  # In the parent shell: record that something failed
   if [[ $ec -ne 0 ]]; then
-    overall_status=1
+    {
+      echo "process_app failed for app ${app_name} (${app_guid}) on foundation ${FOUNDATION_SLUG} (exit ${ec})" >&2
+      echo "fail" >>"$APP_FAIL_FILE"
+    } || true
   fi
 
-  return 0  # we don't propagate failure up; we just log & mark overall_status
+  return 0
 }
 
 workers="${WORKERS:-6}"
-
-# Ensure workers is a sane positive integer
 if ! [[ "$workers" =~ ^[1-9][0-9]*$ ]]; then
   workers=1
 fi
 
 echo "Processing apps (workers: $workers)..." >&2
 
-# Temporarily disable global ERR trap and -e while we process apps
 trap - ERR
 set +e
 
 if (( workers > 1 )); then
   current=0
   declare -a pids=()
-  
   while IFS= read -r app; do
     process_app_wrapper "$app" &
     pids+=($!)
     ((++current))
-    
     if (( current >= workers )); then
       wait -n
       ((--current))
     fi
   done < <(jq -c '.resources // [] | .[]' "$APPS_JSON_FILE")
-  
-  # Critical: Wait for ALL jobs to complete
+
   for pid in "${pids[@]}"; do
     wait "$pid" 2>/dev/null || true
   done
@@ -1179,44 +1156,33 @@ else
   done < <(jq -c '.resources // [] | .[]' "$APPS_JSON_FILE")
 fi
 
-# Restore strict mode and global ERR trap
 set -e
 trap "$ORIGINAL_ERR_TRAP" ERR
 
-if (( overall_status != 0 )); then
+if [[ -s "$APP_FAIL_FILE" ]]; then
   echo "WARNING: One or more apps failed to process on foundation ${FOUNDATION_SLUG}. See ERROR lines above for details." >&2
 fi
 
 echo "Note: Developer_Count in app_data is per-app; developer_space_data provides normalized per-space records." >&2
+
+if [[ -n "$DEVELOPER_DATA_OUT" ]]; then
+  write_developer_space_data
+fi
+
 ###############################################################################
 # Service bindings (all brokers)
-#
-# Collect service binding information across all brokers. This section fetches
-# all service binding information across all brokers and produces rows for:
-#   - app bindings (binding_type=app)
-#   - key bindings (binding_type=key)
-#   - unbound instances (binding_type=none)
-#
-# Fixes:
-#   - Preload /v3/service_credential_bindings once and filter client‑side to
-#     avoid server‑side filter issues (which previously made everything look
-#     unbound).
-#   - Fix jq quoting in parallel_get_binding_details_map so the filter
-#     {($g): .} is parsed correctly.
-#   - Always populate Org/Space for unbound instances using v2 caches via
-#     get_space_org_names_safe.
 ###############################################################################
 
 if [[ -n "$SERVICE_BINDINGS_OUT" ]]; then
   echo "Collecting service binding data (all brokers)..." >&2
 
-  # Preload all service credential bindings once for the foundation.  The
-  # previous implementation relied on /v3/service_credential_bindings
-  # filters per broker, which returned no rows on some foundations and caused
-  # every binding to be classified as "none".
-  SERVICE_CRED_BINDINGS_FILE="$WORK_DIR/service_credential_bindings.json"
-  fetch_all_pages_v3 "/v3/service_credential_bindings" \
-    >"$SERVICE_CRED_BINDINGS_FILE" || echo '[]' >"$SERVICE_CRED_BINDINGS_FILE"
+  PULL_SERVICE_CREDENTIALS="${PULL_SERVICE_CREDENTIALS:-0}"
+
+  FETCH_CREDENTIAL_DETAILS=0
+  if [[ "$PULL_SERVICE_CREDENTIALS" == "1" ]]; then
+    FETCH_CREDENTIAL_DETAILS=1
+  fi
+  export FETCH_CREDENTIAL_DETAILS
 
   get_all() {
     local path="$1"
@@ -1229,7 +1195,6 @@ if [[ -n "$SERVICE_BINDINGS_OUT" ]]; then
         fi
         local resp
         resp="$(cf curl "$path" 2>/dev/null || echo '{}')"
-        # Output each resource; if .resources is null, substitute an empty array
         jq -rc '.resources // [] | .[]' <<<"$resp"
         local next
         next="$(jq -r '.pagination.next.href // ""' <<<"$resp")"
@@ -1282,27 +1247,22 @@ if [[ -n "$SERVICE_BINDINGS_OUT" ]]; then
 
   parallel_get_objs() {
     local base="$1"
-    # Fetch each object in parallel using its GUID appended to the base path.
     env BASE="$base" xargs -I{} -P 16 bash -c 'cf curl "$BASE/{}" 2>/dev/null' \
       | jq -s '[.[] | select(type=="object" and .guid != null)]'
   }
 
   parallel_get_binding_details_map() {
-    # Build a JSON object mapping each GUID to its details.  We must prevent
-    # the shell from expanding $g inside the jq program; use "\$g" so jq sees
-    # the variable and not an empty string.
     xargs -I{} -P 16 bash -c '
       guid="{}"
       cf curl "/v3/service_credential_bindings/$guid/details" 2>/dev/null |
-      jq -c --arg g "$guid" "{ (\$g): . }"
-    ' | jq -s 'add // {}'
+      jq -c --arg g "$guid" "{ ($g): . }"
+    ' | jq -s 'add'
   }
 
-  # app bindings
   app_jq_script=$(cat <<'JQAPP'
 def safe_name(m; k): (m[0][k]? | objects | .name?) // "N/A";
 def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
-.[]
+.[]                                   # iterate over each app binding
 | . as $b
 | ($b.guid // "N/A") as $bid
 | "app" as $btype
@@ -1334,11 +1294,10 @@ def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
 JQAPP
 )
 
-  # key bindings
   key_jq_script=$(cat <<'JQKEY'
 def safe_name(m; k): (m[0][k]? | objects | .name?) // "N/A";
 def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
-.[]
+.[]                                   # iterate over each key binding
 | . as $b
 | ($b.guid // "N/A") as $bid
 | "key" as $btype
@@ -1346,6 +1305,7 @@ def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
 | ($b.relationships.service_instance.data.guid? // null) as $si
 | (safe_val($INST; $si; "plan_guid"))            as $plan_guid
 | (safe_val($PLAN; $plan_guid; "offering_guid")) as $off_guid
+| (safe_val($INST; $si; "space_guid"))           as $space_guid
 | ($DET[0][$bid].credentials? // {}) as $creds
 | ($creds.url // $creds.uri // $creds.connection // $creds.jdbcUrl // $creds.jdbc_url // "") as $uri
 | [
@@ -1357,19 +1317,17 @@ def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
     ($si // ""),
     $bid,
     $bname,
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
+    "", "",
+    safe_name($SPACE; $space_guid),
+    ($space_guid // ""),
+    safe_name($ORG;   (safe_val($SPACE; $space_guid; "org_guid"))),
+    (safe_val($SPACE; $space_guid; "org_guid") // ""),
     ($uri // ""),
     (if $creds=={} then "" else ($creds|tojson) end)
   ] | @tsv
 JQKEY
 )
 
-  # unbound instances
   unbound_jq_script=$(cat <<'JQUNB'
 def safe_name(m; k): (m[0][k]? | objects | .name?) // "N/A";
 def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
@@ -1387,7 +1345,7 @@ def bound_si_guids:
 | "" as $bname
 | (safe_val($INST; $si; "plan_guid"))            as $plan_guid
 | (safe_val($PLAN; $plan_guid; "offering_guid")) as $off_guid
-| (safe_val($INST; $si; "space_guid"))           as $space_guid
+| (safe_val($INST; $si; "space_guid") // ($i.relationships.space.data.guid // null)) as $space_guid
 | [
     $BROKER,
     $btype,
@@ -1409,55 +1367,50 @@ def bound_si_guids:
 JQUNB
 )
 
-  brokers_json=$(fetch_all_pages_v3 "/v3/service_brokers")
+  process_broker() {
+    local broker_guid="$1"
+    [[ -z "$broker_guid" || "$broker_guid" == "null" ]] && return 0
 
-  while IFS= read -r broker; do
-    [[ -z "$broker" || "$broker" == "null" ]] && continue
+    local broker_json broker_name
+    broker_json=$(cf curl "/v3/service_brokers/${broker_guid}" 2>/dev/null || echo '{}')
+    broker_name=$(jq -r '.name // "unknown"' <<<"$broker_json")
 
-    broker_name=$(jq -r '.name' <<<"$broker")
-    broker_guid=$(jq -r '.guid' <<<"$broker")
     echo "  → Broker: $broker_name" >&2
+
+    local offerings offer_guids_csv plans instances bindings app_bindings key_bindings
 
     offerings="$(get_all "/v3/service_offerings?service_broker_guids=${broker_guid}")"
     if [[ "$(jq 'length' <<<"$offerings")" -eq 0 ]]; then
-      continue
+      return 0
     fi
-    offer_guids_csv="$(jq -r '.[].guid' <<<"$offerings" | paste -sd, -)"
 
+    offer_guids_csv="$(jq -r '.[].guid' <<<"$offerings" | paste -sd, -)"
     plans="$(get_all "/v3/service_plans?service_offering_guids=${offer_guids_csv}")"
     mapfile -t PLAN_GUIDS < <(jq -r '.[].guid' <<<"$plans")
     if ((${#PLAN_GUIDS[@]} == 0)); then
-      continue
+      return 0
     fi
 
     instances="$(fetch_with_param_chunks "/v3/service_instances" "service_plan_guids" 50 "" "${PLAN_GUIDS[@]}")"
     if [[ "$(jq 'length' <<<"$instances")" -eq 0 ]]; then
-      continue
+      return 0
     fi
     mapfile -t INSTANCE_GUIDS < <(jq -r '.[].guid' <<<"$instances")
 
-    # Filter the global bindings down to instances belonging to this broker.
-    if ((${#INSTANCE_GUIDS[@]})); then
-      inst_filter_json=$(printf '%s\n' "${INSTANCE_GUIDS[@]}" \
-        | jq -R -s -c 'split("\n") | map(select(length>0))')
-    else
-      inst_filter_json='[]'
-    fi
-
-    app_bindings="$(jq -c --argjson insts "$inst_filter_json" '
-        .[]
-        | select(.relationships.service_instance.data.guid as $g | $insts | index($g))
-        | select(.type == "app")
-      ' "$SERVICE_CRED_BINDINGS_FILE" | jq -s '[.[]]')"
-
-    key_bindings="$(jq -c --argjson insts "$inst_filter_json" '
-        .[]
-        | select(.relationships.service_instance.data.guid as $g | $insts | index($g))
-        | select(.type == "key")
-      ' "$SERVICE_CRED_BINDINGS_FILE" | jq -s '[.[]]')"
+    bindings="$(fetch_with_param_chunks "/v3/service_credential_bindings" "service_instance_guids" 50 "" "${INSTANCE_GUIDS[@]}")"
+    app_bindings=$(jq -c '[.[] |
+      select(
+        (.type // "") == "app"
+        or ((.type // "") == "" and (.relationships.app // null) != null)
+      )]' <<<"$bindings")
+    key_bindings=$(jq -c '[.[] |
+      select(
+        (.type // "") == "key"
+        or ((.type // "") == "" and (.relationships.app // null) == null)
+      )]' <<<"$bindings")
 
     mapfile -t APP_GUIDS < <(jq -r '.[].relationships.app.data.guid' <<<"$app_bindings" | sort -u)
-    apps='[]'
+    local apps='[]'
     if ((${#APP_GUIDS[@]})); then
       apps="$(printf '%s\n' "${APP_GUIDS[@]}" | parallel_get_objs "/v3/apps")"
     fi
@@ -1468,13 +1421,13 @@ JQUNB
         jq -r '.[].relationships.space.data.guid' <<<"$instances"
       } | sort -u
     )
-    spaces='[]'
+    local spaces='[]'
     if ((${#SPACE_GUIDS[@]})); then
       spaces="$(printf '%s\n' "${SPACE_GUIDS[@]}" | parallel_get_objs "/v3/spaces")"
     fi
 
     mapfile -t ORG_GUIDS < <(jq -r '.[].relationships.organization.data.guid' <<<"$spaces" | sort -u)
-    orgs='[]'
+    local orgs='[]'
     if ((${#ORG_GUIDS[@]})); then
       orgs="$(printf '%s\n' "${ORG_GUIDS[@]}" | parallel_get_objs "/v3/organizations")"
     fi
@@ -1482,15 +1435,15 @@ JQUNB
     mapfile -t APP_BINDING_GUIDS < <(jq -r '.[].guid' <<<"$app_bindings")
     mapfile -t KEY_BINDING_GUIDS < <(jq -r '.[].guid' <<<"$key_bindings")
 
-    app_detail_map='{}'
-    if ((${#APP_BINDING_GUIDS[@]})); then
+    local app_detail_map='{}' key_detail_map='{}'
+    if (( FETCH_CREDENTIAL_DETAILS )) && ((${#APP_BINDING_GUIDS[@]})); then
       app_detail_map="$(printf '%s\n' "${APP_BINDING_GUIDS[@]}" | parallel_get_binding_details_map)"
     fi
-    key_detail_map='{}'
-    if ((${#KEY_BINDING_GUIDS[@]})); then
+    if (( FETCH_CREDENTIAL_DETAILS )) && ((${#KEY_BINDING_GUIDS[@]})); then
       key_detail_map="$(printf '%s\n' "${KEY_BINDING_GUIDS[@]}" | parallel_get_binding_details_map)"
     fi
 
+    local offer_map plan_map inst_map app_map space_map org_map
     offer_map="$(jq -c 'map({key:.guid, value:{name:.name}}) | from_entries' <<<"$offerings")"
     plan_map="$(jq -c 'map({key:.guid, value:{name:.name, offering_guid:.relationships.service_offering.data.guid}}) | from_entries' <<<"$plans")"
     inst_map="$(jq -c 'map({key:.guid, value:{name:.name, plan_guid:.relationships.service_plan.data.guid, space_guid:.relationships.space.data.guid}}) | from_entries' <<<"$instances")"
@@ -1498,6 +1451,7 @@ JQUNB
     space_map="$(jq -c 'map({key:.guid, value:{name:.name, org_guid:.relationships.organization.data.guid}}) | from_entries' <<<"$spaces")"
     org_map="$(jq -c 'map({key:.guid, value:{name:.name}}) | from_entries' <<<"$orgs")"
 
+    local tmpdir offer_file plan_file inst_file app_file space_file org_file det_app_file det_key_file app_bind_file key_bind_file
     tmpdir="$(mktemp -d)"
     offer_file="$tmpdir/offer.json"
     plan_file="$tmpdir/plan.json"
@@ -1521,7 +1475,6 @@ JQUNB
     printf '%s' "$app_bindings"   >"$app_bind_file"
     printf '%s' "$key_bindings"   >"$key_bind_file"
 
-    # app bindings
     jq -r \
       --arg BROKER "$broker_name" \
       --slurpfile OFFER "$offer_file" \
@@ -1531,16 +1484,9 @@ JQUNB
       --slurpfile SPACE "$space_file" \
       --slurpfile ORG   "$org_file" \
       --slurpfile DET   "$det_app_file" \
-      "$app_jq_script" <"$app_bind_file" \
+      "$app_jq_script" <<<"$app_bindings" \
     | while IFS=$'\t' read -r broker_name bt offer_name plan_name si_name si_guid binding_guid binding_name app_name app_guid space_name space_guid org_name org_guid cred_uri creds_json; do
-        # Fill in missing space/org from v2 caches if jq could not resolve them.
-        if { [[ -z "$space_name" || "$space_name" == "N/A" ]] || [[ -z "$org_name" || "$org_name" == "N/A" ]]; } && [[ -n "$space_guid" ]]; then
-          so="$(get_space_org_names_safe "/v2/spaces/$space_guid")"
-          IFS='|' read -r resolved_space resolved_org <<<"$so"
-          [[ -n "$resolved_space" ]] && space_name="$resolved_space"
-          [[ -n "$resolved_org"   ]] && org_name="$resolved_org"
-        fi
-
+        local redacted_uri redacted_creds
         redacted_uri=$(redact_credentials "$cred_uri")
         redacted_creds=$(redact_credentials "$creds_json")
         csv_write_row "$SERVICE_BINDINGS_OUT" \
@@ -1551,22 +1497,17 @@ JQUNB
           "$FOUNDATION_SLUG" "$BATCH_ID"
       done
 
-    # key bindings
     jq -r \
       --arg BROKER "$broker_name" \
       --slurpfile OFFER "$offer_file" \
       --slurpfile PLAN  "$plan_file" \
       --slurpfile INST  "$inst_file" \
+      --slurpfile SPACE "$space_file" \
+      --slurpfile ORG   "$org_file" \
       --slurpfile DET   "$det_key_file" \
-      "$key_jq_script" <"$key_bind_file" \
+      "$key_jq_script" <<<"$key_bindings" \
     | while IFS=$'\t' read -r broker_name bt offer_name plan_name si_name si_guid binding_guid binding_name app_name app_guid space_name space_guid org_name org_guid cred_uri creds_json; do
-        if { [[ -z "$space_name" || "$space_name" == "N/A" ]] || [[ -z "$org_name" || "$org_name" == "N/A" ]]; } && [[ -n "$space_guid" ]]; then
-          so="$(get_space_org_names_safe "/v2/spaces/$space_guid")"
-          IFS='|' read -r resolved_space resolved_org <<<"$so"
-          [[ -n "$resolved_space" ]] && space_name="$resolved_space"
-          [[ -n "$resolved_org"   ]] && org_name="$resolved_org"
-        fi
-
+        local redacted_uri redacted_creds
         redacted_uri=$(redact_credentials "$cred_uri")
         redacted_creds=$(redact_credentials "$creds_json")
         csv_write_row "$SERVICE_BINDINGS_OUT" \
@@ -1577,7 +1518,6 @@ JQUNB
           "$FOUNDATION_SLUG" "$BATCH_ID"
       done
 
-    # unbound instances
     jq -r \
       --arg BROKER "$broker_name" \
       --slurpfile OFFER "$offer_file" \
@@ -1589,15 +1529,7 @@ JQUNB
       --slurpfile KEYB  "$key_bind_file" \
       "$unbound_jq_script" <<<"$instances" \
     | while IFS=$'\t' read -r broker_name bt offer_name plan_name si_name si_guid binding_guid binding_name app_name app_guid space_name space_guid org_name org_guid cred_uri creds_json; do
-        # For truly unbound instances we always have an originating space; resolve
-        # human‑readable names from the v2 caches if jq did not find them.
-        if { [[ -z "$space_name" || "$space_name" == "N/A" ]] || [[ -z "$org_name" || "$org_name" == "N/A" ]]; } && [[ -n "$space_guid" ]]; then
-          so="$(get_space_org_names_safe "/v2/spaces/$space_guid")"
-          IFS='|' read -r resolved_space resolved_org <<<"$so"
-          [[ -n "$resolved_space" ]] && space_name="$resolved_space"
-          [[ -n "$resolved_org"   ]] && org_name="$resolved_org"
-        fi
-
+        local redacted_uri redacted_creds
         redacted_uri=$(redact_credentials "$cred_uri")
         redacted_creds=$(redact_credentials "$creds_json")
         csv_write_row "$SERVICE_BINDINGS_OUT" \
@@ -1609,7 +1541,20 @@ JQUNB
       done
 
     rm -rf "$tmpdir"
-  done < <(jq -c '.[]' <<<"$brokers_json")
+  }
+
+  export app_jq_script key_jq_script unbound_jq_script
+  export -f get_all fetch_with_param_chunks parallel_get_objs parallel_get_binding_details_map \
+            process_broker csv_write_row redact_credentials
+
+  brokers_json=$(fetch_all_pages_v3 "/v3/service_brokers")
+  mapfile -t BROKER_GUIDS < <(jq -r '.[].guid // empty' <<<"$brokers_json")
+
+  BROKER_WORKERS="${BROKER_WORKERS:-3}"
+  if ((${#BROKER_GUIDS[@]})); then
+    printf '%s\n' "${BROKER_GUIDS[@]}" \
+      | xargs -n1 -P "$BROKER_WORKERS" bash -c 'process_broker "$1"' _
+  fi
 fi
 
 echo "Data collection complete." >&2
