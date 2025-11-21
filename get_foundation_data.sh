@@ -1192,13 +1192,31 @@ echo "Note: Developer_Count in app_data is per-app; developer_space_data provide
 # Service bindings (all brokers)
 #
 # Collect service binding information across all brokers. This section fetches
-# all service brokers and iterates through each to produce service binding
-# rows for app bindings, key bindings, and unbound service instances. It
-# leverages parallelism and caching to efficiently gather the necessary data.
+# all service binding information across all brokers and produces rows for:
+#   - app bindings (binding_type=app)
+#   - key bindings (binding_type=key)
+#   - unbound instances (binding_type=none)
+#
+# Fixes:
+#   - Preload /v3/service_credential_bindings once and filter client‑side to
+#     avoid server‑side filter issues (which previously made everything look
+#     unbound).
+#   - Fix jq quoting in parallel_get_binding_details_map so the filter
+#     {($g): .} is parsed correctly.
+#   - Always populate Org/Space for unbound instances using v2 caches via
+#     get_space_org_names_safe.
 ###############################################################################
 
 if [[ -n "$SERVICE_BINDINGS_OUT" ]]; then
   echo "Collecting service binding data (all brokers)..." >&2
+
+  # Preload all service credential bindings once for the foundation.  The
+  # previous implementation relied on /v3/service_credential_bindings
+  # filters per broker, which returned no rows on some foundations and caused
+  # every binding to be classified as "none".
+  SERVICE_CRED_BINDINGS_FILE="$WORK_DIR/service_credential_bindings.json"
+  fetch_all_pages_v3 "/v3/service_credential_bindings" \
+    >"$SERVICE_CRED_BINDINGS_FILE" || echo '[]' >"$SERVICE_CRED_BINDINGS_FILE"
 
   get_all() {
     local path="$1"
@@ -1264,30 +1282,27 @@ if [[ -n "$SERVICE_BINDINGS_OUT" ]]; then
 
   parallel_get_objs() {
     local base="$1"
-    # Fetch each object in parallel.  We pass the base URL via an environment variable
-    # to the subshell to avoid referencing $0 (which refers to the bash executable).
-    # Within the subshell, $BASE holds the base path and {} is replaced with the GUID.
+    # Fetch each object in parallel using its GUID appended to the base path.
     env BASE="$base" xargs -I{} -P 16 bash -c 'cf curl "$BASE/{}" 2>/dev/null' \
       | jq -s '[.[] | select(type=="object" and .guid != null)]'
   }
 
   parallel_get_binding_details_map() {
-    # Build a JSON object mapping each GUID to its details.  We avoid using
-    # positional parameters because xargs passes the replacement as $0 by
-    # default.  Instead, we assign the GUID directly within the subshell
-    # and use jq to construct an object keyed by the GUID.
+    # Build a JSON object mapping each GUID to its details.  We must prevent
+    # the shell from expanding $g inside the jq program; use "\$g" so jq sees
+    # the variable and not an empty string.
     xargs -I{} -P 16 bash -c '
       guid="{}"
       cf curl "/v3/service_credential_bindings/$guid/details" 2>/dev/null |
-      jq -c --arg g "$guid" "{ ($g): . }"
-    ' | jq -s 'add'
+      jq -c --arg g "$guid" "{ (\$g): . }"
+    ' | jq -s 'add // {}'
   }
 
   # app bindings
   app_jq_script=$(cat <<'JQAPP'
 def safe_name(m; k): (m[0][k]? | objects | .name?) // "N/A";
 def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
-.[]                                   # iterate over each app binding
+.[]
 | . as $b
 | ($b.guid // "N/A") as $bid
 | "app" as $btype
@@ -1319,11 +1334,11 @@ def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
 JQAPP
 )
 
-  # key bindings – now include space & org for the underlying service instance
+  # key bindings
   key_jq_script=$(cat <<'JQKEY'
 def safe_name(m; k): (m[0][k]? | objects | .name?) // "N/A";
 def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
-.[]                                   # iterate over each key binding
+.[]
 | . as $b
 | ($b.guid // "N/A") as $bid
 | "key" as $btype
@@ -1331,7 +1346,6 @@ def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
 | ($b.relationships.service_instance.data.guid? // null) as $si
 | (safe_val($INST; $si; "plan_guid"))            as $plan_guid
 | (safe_val($PLAN; $plan_guid; "offering_guid")) as $off_guid
-| (safe_val($INST; $si; "space_guid"))           as $space_guid
 | ($DET[0][$bid].credentials? // {}) as $creds
 | ($creds.url // $creds.uri // $creds.connection // $creds.jdbcUrl // $creds.jdbc_url // "") as $uri
 | [
@@ -1343,18 +1357,19 @@ def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
     ($si // ""),
     $bid,
     $bname,
-    "", "",
-    safe_name($SPACE; $space_guid),
-    ($space_guid // ""),
-    safe_name($ORG;   (safe_val($SPACE; $space_guid; "org_guid"))),
-    (safe_val($SPACE; $space_guid; "org_guid") // ""),
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
     ($uri // ""),
     (if $creds=={} then "" else ($creds|tojson) end)
   ] | @tsv
 JQKEY
 )
 
-  # unbound instances – ensure we always derive space/org from the instance
+  # unbound instances
   unbound_jq_script=$(cat <<'JQUNB'
 def safe_name(m; k): (m[0][k]? | objects | .name?) // "N/A";
 def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
@@ -1372,7 +1387,7 @@ def bound_si_guids:
 | "" as $bname
 | (safe_val($INST; $si; "plan_guid"))            as $plan_guid
 | (safe_val($PLAN; $plan_guid; "offering_guid")) as $off_guid
-| (safe_val($INST; $si; "space_guid") // ($i.relationships.space.data.guid // null)) as $space_guid
+| (safe_val($INST; $si; "space_guid"))           as $space_guid
 | [
     $BROKER,
     $btype,
@@ -1408,6 +1423,7 @@ JQUNB
       continue
     fi
     offer_guids_csv="$(jq -r '.[].guid' <<<"$offerings" | paste -sd, -)"
+
     plans="$(get_all "/v3/service_plans?service_offering_guids=${offer_guids_csv}")"
     mapfile -t PLAN_GUIDS < <(jq -r '.[].guid' <<<"$plans")
     if ((${#PLAN_GUIDS[@]} == 0)); then
@@ -1420,20 +1436,25 @@ JQUNB
     fi
     mapfile -t INSTANCE_GUIDS < <(jq -r '.[].guid' <<<"$instances")
 
-    # Fetch all credential bindings for these service instances in a single call.
-    # We deliberately avoid using the 'type' filter here because not all CAPI
-    # versions support it; filtering is done locally instead.
-    bindings="$(fetch_with_param_chunks "/v3/service_credential_bindings" "service_instance_guids" 50 "" "${INSTANCE_GUIDS[@]}")"
-    app_bindings=$(jq -c '[.[] |
-      select(
-        (.type // "") == "app"
-        or ((.type // "") == "" and (.relationships.app // null) != null)
-      )]' <<<"$bindings")
-    key_bindings=$(jq -c '[.[] |
-      select(
-        (.type // "") == "key"
-        or ((.type // "") == "" and (.relationships.app // null) == null)
-      )]' <<<"$bindings")
+    # Filter the global bindings down to instances belonging to this broker.
+    if ((${#INSTANCE_GUIDS[@]})); then
+      inst_filter_json=$(printf '%s\n' "${INSTANCE_GUIDS[@]}" \
+        | jq -R -s -c 'split("\n") | map(select(length>0))')
+    else
+      inst_filter_json='[]'
+    fi
+
+    app_bindings="$(jq -c --argjson insts "$inst_filter_json" '
+        .[]
+        | select(.relationships.service_instance.data.guid as $g | $insts | index($g))
+        | select(.type == "app")
+      ' "$SERVICE_CRED_BINDINGS_FILE" | jq -s '[.[]]')"
+
+    key_bindings="$(jq -c --argjson insts "$inst_filter_json" '
+        .[]
+        | select(.relationships.service_instance.data.guid as $g | $insts | index($g))
+        | select(.type == "key")
+      ' "$SERVICE_CRED_BINDINGS_FILE" | jq -s '[.[]]')"
 
     mapfile -t APP_GUIDS < <(jq -r '.[].relationships.app.data.guid' <<<"$app_bindings" | sort -u)
     apps='[]'
@@ -1451,6 +1472,7 @@ JQUNB
     if ((${#SPACE_GUIDS[@]})); then
       spaces="$(printf '%s\n' "${SPACE_GUIDS[@]}" | parallel_get_objs "/v3/spaces")"
     fi
+
     mapfile -t ORG_GUIDS < <(jq -r '.[].relationships.organization.data.guid' <<<"$spaces" | sort -u)
     orgs='[]'
     if ((${#ORG_GUIDS[@]})); then
@@ -1459,6 +1481,7 @@ JQUNB
 
     mapfile -t APP_BINDING_GUIDS < <(jq -r '.[].guid' <<<"$app_bindings")
     mapfile -t KEY_BINDING_GUIDS < <(jq -r '.[].guid' <<<"$key_bindings")
+
     app_detail_map='{}'
     if ((${#APP_BINDING_GUIDS[@]})); then
       app_detail_map="$(printf '%s\n' "${APP_BINDING_GUIDS[@]}" | parallel_get_binding_details_map)"
@@ -1475,7 +1498,6 @@ JQUNB
     space_map="$(jq -c 'map({key:.guid, value:{name:.name, org_guid:.relationships.organization.data.guid}}) | from_entries' <<<"$spaces")"
     org_map="$(jq -c 'map({key:.guid, value:{name:.name}}) | from_entries' <<<"$orgs")"
 
-    # Temporary directory for passing data into jq (same as before)
     tmpdir="$(mktemp -d)"
     offer_file="$tmpdir/offer.json"
     plan_file="$tmpdir/plan.json"
@@ -1509,8 +1531,16 @@ JQUNB
       --slurpfile SPACE "$space_file" \
       --slurpfile ORG   "$org_file" \
       --slurpfile DET   "$det_app_file" \
-      "$app_jq_script" <<<"$app_bindings" \
+      "$app_jq_script" <"$app_bind_file" \
     | while IFS=$'\t' read -r broker_name bt offer_name plan_name si_name si_guid binding_guid binding_name app_name app_guid space_name space_guid org_name org_guid cred_uri creds_json; do
+        # Fill in missing space/org from v2 caches if jq could not resolve them.
+        if { [[ -z "$space_name" || "$space_name" == "N/A" ]] || [[ -z "$org_name" || "$org_name" == "N/A" ]]; } && [[ -n "$space_guid" ]]; then
+          so="$(get_space_org_names_safe "/v2/spaces/$space_guid")"
+          IFS='|' read -r resolved_space resolved_org <<<"$so"
+          [[ -n "$resolved_space" ]] && space_name="$resolved_space"
+          [[ -n "$resolved_org"   ]] && org_name="$resolved_org"
+        fi
+
         redacted_uri=$(redact_credentials "$cred_uri")
         redacted_creds=$(redact_credentials "$creds_json")
         csv_write_row "$SERVICE_BINDINGS_OUT" \
@@ -1527,11 +1557,16 @@ JQUNB
       --slurpfile OFFER "$offer_file" \
       --slurpfile PLAN  "$plan_file" \
       --slurpfile INST  "$inst_file" \
-      --slurpfile SPACE "$space_file" \
-      --slurpfile ORG   "$org_file" \
       --slurpfile DET   "$det_key_file" \
-      "$key_jq_script" <<<"$key_bindings" \
+      "$key_jq_script" <"$key_bind_file" \
     | while IFS=$'\t' read -r broker_name bt offer_name plan_name si_name si_guid binding_guid binding_name app_name app_guid space_name space_guid org_name org_guid cred_uri creds_json; do
+        if { [[ -z "$space_name" || "$space_name" == "N/A" ]] || [[ -z "$org_name" || "$org_name" == "N/A" ]]; } && [[ -n "$space_guid" ]]; then
+          so="$(get_space_org_names_safe "/v2/spaces/$space_guid")"
+          IFS='|' read -r resolved_space resolved_org <<<"$so"
+          [[ -n "$resolved_space" ]] && space_name="$resolved_space"
+          [[ -n "$resolved_org"   ]] && org_name="$resolved_org"
+        fi
+
         redacted_uri=$(redact_credentials "$cred_uri")
         redacted_creds=$(redact_credentials "$creds_json")
         csv_write_row "$SERVICE_BINDINGS_OUT" \
@@ -1554,6 +1589,15 @@ JQUNB
       --slurpfile KEYB  "$key_bind_file" \
       "$unbound_jq_script" <<<"$instances" \
     | while IFS=$'\t' read -r broker_name bt offer_name plan_name si_name si_guid binding_guid binding_name app_name app_guid space_name space_guid org_name org_guid cred_uri creds_json; do
+        # For truly unbound instances we always have an originating space; resolve
+        # human‑readable names from the v2 caches if jq did not find them.
+        if { [[ -z "$space_name" || "$space_name" == "N/A" ]] || [[ -z "$org_name" || "$org_name" == "N/A" ]]; } && [[ -n "$space_guid" ]]; then
+          so="$(get_space_org_names_safe "/v2/spaces/$space_guid")"
+          IFS='|' read -r resolved_space resolved_org <<<"$so"
+          [[ -n "$resolved_space" ]] && space_name="$resolved_space"
+          [[ -n "$resolved_org"   ]] && org_name="$resolved_org"
+        fi
+
         redacted_uri=$(redact_credentials "$cred_uri")
         redacted_creds=$(redact_credentials "$creds_json")
         csv_write_row "$SERVICE_BINDINGS_OUT" \
