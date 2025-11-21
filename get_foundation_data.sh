@@ -48,6 +48,39 @@ command -v jq    >/dev/null 2>&1 || { echo "jq not found in PATH" >&2; exit 6; }
 command -v xargs >/dev/null 2>&1 || { echo "xargs not found in PATH" >&2; exit 6; }
 command -v flock >/dev/null 2>&1 || { echo "flock not found in PATH" >&2; exit 6; }
 
+# Derive a reasonable foundation slug from CF_API when the orchestrator
+# does not provide CF_FOUNDATION or CF_ORCH_PLATFORM.
+# Examples:
+#   CF_API="https://api.system.fd-prod-chd.example.com"
+#      → fd-prod-chd.example.com
+#   CF_API="api.system.fd-nonprod-oma.example.com"
+#      → fd-nonprod-oma.example.com
+#   CF_API="https://api.fd-nonprod-oma.example.com"
+#      → fd-nonprod-oma.example.com
+derive_foundation_from_api() {
+  local api="${CF_API:-}"
+
+  # Nothing to do if CF_API is unset/empty
+  [[ -z "$api" ]] && return 0
+
+  # Strip protocol if present (no-op if not there)
+  api="${api#http://}"
+  api="${api#https://}"
+
+  # Drop any path component (/v2, /v3, etc.)
+  api="${api%%/*}"
+
+  # Now api is just the host, e.g. api.system.fd-prod-chd.example.com
+
+  # Drop common prefixes so we don't end up with "api" or "system" as the key
+  api="${api#api.}"
+  api="${api#system.}"
+
+  printf '%s\n' "$api"
+}
+
+export -f derive_foundation_from_api
+
 # ----------------------------- Configuration -----------------------------
 # Output mode: "single" (legacy: single CSV to stdout/file) or "multi" (recommended)
 OUTPUT_MODE="${CF_ORCH_DATA_MODE:-multi}"
@@ -58,53 +91,9 @@ OUTPUT_MODE="${CF_ORCH_DATA_MODE:-multi}"
 BASE_OUTPUT="${CF_ORCH_DATA_OUT:-./foundation_data}"
 
 # Foundation key used for env mapping (can be set from orchestrator)
-# Priority:
-#   1) CF_FOUNDATION
-#   2) CF_ORCH_PLATFORM
-#   3) CF_API / cf target (derived from API endpoint host)
-#   4) "UNKNOWN_FOUNDATION"
-FOUNDATION_KEY="${CF_FOUNDATION:-${CF_ORCH_PLATFORM:-}}"
+FOUNDATION_API_FALLBACK="$(derive_foundation_from_api || true)"
 
-if [[ -z "$FOUNDATION_KEY" ]]; then
-  # Try CF_API first (e.g. "https://api.system.fd-nonprod-chd.domain.com"
-  # or just "api.system.fd-nonprod-chd.domain.com")
-  api_endpoint="${CF_API:-}"
-
-  if [[ -z "$api_endpoint" ]]; then
-    # Fallback to `cf target` output; ignore errors
-    # Example line: "api endpoint:   https://api.system.fd-nonprod-chd.domain.com"
-    api_endpoint="$(cf target 2>/dev/null | awk '/api endpoint:/ {print $3}' || true)"
-  fi
-
-  if [[ -n "$api_endpoint" ]]; then
-    # Strip scheme if present; if not present, this is a no-op.
-    # "https://api.system.fd-nonprod-chd.domain.com" -> "api.system.fd-nonprod-chd.domain.com"
-    # "api.system.fd-nonprod-chd.domain.com"        -> "api.system.fd-nonprod-chd.domain.com"
-    api_host="${api_endpoint#*://}"
-
-    # Strip any path if present
-    # "api.system.fd-nonprod-chd.domain.com/v3" -> "api.system.fd-nonprod-chd.domain.com"
-    api_host="${api_host%%/*}"
-
-    # Drop leading "api." if present
-    # "api.system.fd-nonprod-chd.domain.com" -> "system.fd-nonprod-chd.domain.com"
-    api_host="${api_host#api.}"
-
-    # Drop leading "system." so we never end up with a foundation key of just "system"
-    # "system.fd-nonprod-chd.domain.com" -> "fd-nonprod-chd.domain.com"
-    api_host="${api_host#system.}"
-
-    # Only adopt it if we still have something non-empty
-    if [[ -n "$api_host" ]]; then
-      FOUNDATION_KEY="$api_host"
-    fi
-  fi
-fi
-
-# Absolute last resort if nothing was discovered
-if [[ -z "$FOUNDATION_KEY" ]]; then
-  FOUNDATION_KEY="UNKNOWN_FOUNDATION"
-fi
+FOUNDATION_KEY="${CF_FOUNDATION:-${CF_ORCH_PLATFORM:-${FOUNDATION_API_FALLBACK:-UNKNOWN_FOUNDATION}}}"
 
 # Batch tracking (can be provided externally)
 BATCH_ID="${BATCH_ID:-$(date +%Y%m%d_%H%M%S)}"
@@ -1345,9 +1334,12 @@ run_service_bindings_phase() {
     ' | jq -s 'add'
   }
 
+  ###########################################################################
   # jq templates for transforming broker data into flat binding rows
-  local app_jq_script
-  app_jq_script=$(cat <<'JQAPP'
+  # Stored in exported env vars so xargs/spawned bash can see them.
+  ###########################################################################
+
+  APP_BINDINGS_JQ_FILTER=$(cat <<'JQAPP'
 def safe_name(m; k): (m[0][k]? | objects | .name?) // "N/A";
 def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
 .[]                                   # iterate over each app binding
@@ -1382,8 +1374,7 @@ def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
 JQAPP
 )
 
-  local key_jq_script
-  key_jq_script=$(cat <<'JQKEY'
+  KEY_BINDINGS_JQ_FILTER=$(cat <<'JQKEY'
 def safe_name(m; k): (m[0][k]? | objects | .name?) // "N/A";
 def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
 .[]                                   # iterate over each key binding
@@ -1417,8 +1408,7 @@ def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
 JQKEY
 )
 
-  local unbound_jq_script
-  unbound_jq_script=$(cat <<'JQUNB'
+  UNBOUND_INSTANCES_JQ_FILTER=$(cat <<'JQUNB'
 def safe_name(m; k): (m[0][k]? | objects | .name?) // "N/A";
 def safe_val(m; k; f): (m[0][k]? | objects | .[f]?) // null;
 def bound_si_guids:
@@ -1457,6 +1447,11 @@ def bound_si_guids:
 JQUNB
 )
 
+  export APP_BINDINGS_JQ_FILTER KEY_BINDINGS_JQ_FILTER UNBOUND_INSTANCES_JQ_FILTER
+
+  ###########################################################################
+  # Per-broker worker
+  ###########################################################################
   process_broker() {
     local broker_guid="$1"
     [[ -z "$broker_guid" || "$broker_guid" == "null" ]] && return 0
@@ -1565,7 +1560,7 @@ JQUNB
     printf '%s' "$app_bindings"   >"$app_bind_file"
     printf '%s' "$key_bindings"   >"$key_bind_file"
 
-    # App bindings
+    # App bindings → rows
     jq -r \
       --arg BROKER "$broker_name" \
       --slurpfile OFFER "$offer_file" \
@@ -1575,7 +1570,7 @@ JQUNB
       --slurpfile SPACE "$space_file" \
       --slurpfile ORG   "$org_file" \
       --slurpfile DET   "$det_app_file" \
-      "$app_jq_script" <<<"$app_bindings" \
+      "$APP_BINDINGS_JQ_FILTER" <<<"$app_bindings" \
     | while IFS=$'\t' read -r broker_name bt offer_name plan_name si_name si_guid binding_guid binding_name app_name app_guid space_name space_guid org_name org_guid cred_uri creds_json; do
         local redacted_uri redacted_creds
         redacted_uri=$(redact_credentials "$cred_uri")
@@ -1588,7 +1583,7 @@ JQUNB
           "$FOUNDATION_SLUG" "$BATCH_ID"
       done
 
-    # Key bindings
+    # Key bindings → rows
     jq -r \
       --arg BROKER "$broker_name" \
       --slurpfile OFFER "$offer_file" \
@@ -1597,7 +1592,7 @@ JQUNB
       --slurpfile SPACE "$space_file" \
       --slurpfile ORG   "$org_file" \
       --slurpfile DET   "$det_key_file" \
-      "$key_jq_script" <<<"$key_bindings" \
+      "$KEY_BINDINGS_JQ_FILTER" <<<"$key_bindings" \
     | while IFS=$'\t' read -r broker_name bt offer_name plan_name si_name si_guid binding_guid binding_name app_name app_guid space_name space_guid org_name org_guid cred_uri creds_json; do
         local redacted_uri redacted_creds
         redacted_uri=$(redact_credentials "$cred_uri")
@@ -1610,7 +1605,7 @@ JQUNB
           "$FOUNDATION_SLUG" "$BATCH_ID"
       done
 
-    # Unbound instances
+    # Unbound instances → rows
     jq -r \
       --arg BROKER "$broker_name" \
       --slurpfile OFFER "$offer_file" \
@@ -1620,7 +1615,7 @@ JQUNB
       --slurpfile ORG   "$org_file" \
       --slurpfile APPB  "$app_bind_file" \
       --slurpfile KEYB  "$key_bind_file" \
-      "$unbound_jq_script" <<<"$instances" \
+      "$UNBOUND_INSTANCES_JQ_FILTER" <<<"$instances" \
     | while IFS=$'\t' read -r broker_name bt offer_name plan_name si_name si_guid binding_guid binding_name app_name app_guid space_name space_guid org_name org_guid cred_uri creds_json; do
         local redacted_uri redacted_creds
         redacted_uri=$(redact_credentials "$cred_uri")
