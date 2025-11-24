@@ -1628,6 +1628,19 @@ run_service_bindings_phase() {
 
     rm -rf "$tmpdir"
   }
+  
+  export -f get_all fetch_with_param_chunks parallel_get_objs parallel_get_binding_details_map \
+            process_broker csv_write_row redact_credentials
+
+  local brokers_json
+  brokers_json=$(fetch_all_pages_v3 "/v3/service_brokers")
+  mapfile -t BROKER_GUIDS < <(jq -r '.[].guid // empty' <<<"$brokers_json")
+
+  local BROKER_WORKERS="${BROKER_WORKERS:-3}"
+  if ((${#BROKER_GUIDS[@]})); then
+    printf '%s\n' "${BROKER_GUIDS[@]}" \
+      | xargs -n1 -P "$BROKER_WORKERS" bash -c 'process_broker "$1"' _
+  fi
 }
 
 ###############################################################################
