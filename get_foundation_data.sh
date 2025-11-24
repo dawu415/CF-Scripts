@@ -1541,6 +1541,9 @@ run_service_bindings_phase() {
     #######################################################################
     # App bindings → rows
     #######################################################################
+    #######################################################################
+    # App bindings → rows
+    #######################################################################
     jq -r \
       --arg BROKER "$broker_name" \
       --slurpfile OFFER "$offer_file" \
@@ -1550,7 +1553,40 @@ run_service_bindings_phase() {
       --slurpfile SPACE "$space_file" \
       --slurpfile ORG   "$org_file" \
       --slurpfile DET   "$det_app_file" '
-      ...
+      def name_from(m; k):
+        (m[0][k]? | .name? // "N/A");
+      def field_from(m; k; f):
+        (m[0][k]? | .[f]?);
+
+      .[] as $b
+      | ($b.guid // "N/A") as $binding_guid
+      | ($b.name // "")    as $binding_name
+      | ($b.relationships.service_instance.data.guid? // null) as $si_guid
+      | ($b.relationships.app.data.guid?              // null) as $app_guid
+      | field_from($INST;  $si_guid;  "plan_guid")        as $plan_guid
+      | field_from($INST;  $si_guid;  "space_guid")       as $space_guid
+      | field_from($PLAN;  $plan_guid; "offering_guid")   as $off_guid
+      | field_from($SPACE; $space_guid; "org_guid")       as $org_guid
+      | ($DET[0][$binding_guid].credentials? // {})       as $creds
+      | ($creds.url // $creds.uri // $creds.connection // $creds.jdbcUrl // $creds.jdbc_url // "") as $uri
+      | [
+          $BROKER,                               # broker_name
+          "app",                                 # binding_type
+          name_from($OFFER; $off_guid),          # service_offering_name
+          name_from($PLAN;  $plan_guid),         # service_plan_name
+          name_from($INST;  $si_guid),           # service_instance_name
+          ($si_guid // ""),                      # service_instance_guid
+          ($binding_guid // ""),                 # service_binding_guid
+          ($binding_name // ""),                 # binding_name
+          name_from($APP;   $app_guid),          # app_name
+          ($app_guid // ""),                     # app_guid
+          name_from($SPACE; $space_guid),        # space_name
+          ($space_guid // ""),                   # space_guid
+          name_from($ORG;   $org_guid),          # org_name
+          ($org_guid // ""),                     # org_guid
+          ($uri // ""),                          # credential_uri
+          (if $creds == {} then "" else ($creds | tojson) end) # credentials_json
+        ]
       | @tsv
     ' <<<"$app_bindings" \
     | while IFS= read -r tsv_line; do
