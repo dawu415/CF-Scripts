@@ -1253,32 +1253,37 @@ run_developer_space_phase() {
 
 # Phase 3: service bindings (all brokers)
 ###############################################################################
-# Service binding TSV → CSV row normalizer
+# Service binding Unit Separator(US) → CSV row normalizer
+###############################################################################
+###############################################################################
+# Service binding row normalizer
+# We DO NOT use tabs here because Bash collapses empty fields when IFS is
+# whitespace. Instead, jq joins columns with ASCII Unit Separator (0x1F)
+# and we split on that.
 ###############################################################################
 process_binding_tsv_stream() {
-  local tsv_line="$1"
+  local raw_line="$1"
 
-  # Parse the TSV into an array of fields.
+  # Split on US (unit separator), *not* on whitespace.
   local -a cols
-  IFS=$'\t' read -r -a cols <<<"$tsv_line"
+  local -a cols
+  local IFS=$'\x1F'
+  read -r -a cols <<<"$raw_line"
 
-  # Normalize to expected number of "core" binding columns (before Foundation_Slug/Batch_Id).
+  # Number of "core" binding columns (before Foundation_Slug / Batch_Id)
   local expected="${BINDING_TSV_COL_COUNT:-16}"
   local i
+
+  # Pad/truncate to the expected column count
   if ((${#cols[@]} < expected)); then
     for ((i=${#cols[@]}; i<expected; i++)); do
       cols[i]=""
     done
   elif ((${#cols[@]} > expected)); then
-    # Hard trim any accidental extras (defensive).
     cols=("${cols[@]:0:expected}")
   fi
 
-  # Map by index – this must match the order of the jq array:
-  # broker_name, binding_type, service_offering_name, service_plan_name,
-  # service_instance_name, service_instance_guid, service_binding_guid,
-  # binding_name, app_name, app_guid, space_name, space_guid,
-  # org_name, org_guid, credential_uri, credentials_json
+  # Map indices → named fields. This MUST match the jq array order.
   local broker_name="${cols[0]}"
   local bt="${cols[1]}"
   local offer_name="${cols[2]}"
@@ -1297,13 +1302,11 @@ process_binding_tsv_stream() {
   local creds_json="${cols[15]}"
 
   ###########################################################################
-  # Enforce binding-type-specific semantics:
+  # Binding‑type semantics:
   #
-  #  - none: unbound instance → MUST NOT have service_binding_guid,
-  #          binding_name, app_name, app_guid
-  #  - app:  app binding → may or may not have binding_name, but all
-  #          other fields should be populated if known.
-  #  - key:  service key → has binding_guid + binding_name, but no app_*.
+  #  none → unbound instance (no binding/app fields)
+  #  app  → app binding (binding_name may legitimately be empty)
+  #  key  → service key (no app‑scoped fields)
   ###########################################################################
   case "$bt" in
     none)
@@ -1313,22 +1316,20 @@ process_binding_tsv_stream() {
       app_guid=""
       ;;
     key)
-      # Keys are not app-scoped; app_* must be blank.
       app_name=""
       app_guid=""
       ;;
     app)
-      # If binding_name was missing in the API, it is already "" here.
-      :
+      # nothing extra
       ;;
   esac
 
-  # Apply redaction rules to credential fields.
+  # Apply credential redaction
   local redacted_uri redacted_creds
   redacted_uri=$(redact_credentials "$cred_uri")
   redacted_creds=$(redact_credentials "$creds_json")
 
-  # Finally, write a perfectly aligned CSV row.
+  # Emit a perfectly aligned CSV row
   csv_write_row "$SERVICE_BINDINGS_OUT" \
     "$broker_name" "$bt" "$offer_name" "$plan_name" \
     "$si_name" "$si_guid" "$binding_guid" "$binding_name" \
@@ -1541,9 +1542,6 @@ run_service_bindings_phase() {
     #######################################################################
     # App bindings → rows
     #######################################################################
-    #######################################################################
-    # App bindings → rows
-    #######################################################################
     jq -r \
       --arg BROKER "$broker_name" \
       --slurpfile OFFER "$offer_file" \
@@ -1569,28 +1567,28 @@ run_service_bindings_phase() {
       | field_from($SPACE; $space_guid; "org_guid")       as $org_guid
       | ($DET[0][$binding_guid].credentials? // {})       as $creds
       | ($creds.url // $creds.uri // $creds.connection // $creds.jdbcUrl // $creds.jdbc_url // "") as $uri
-      | [
-          $BROKER,                               # broker_name
-          "app",                                 # binding_type
-          name_from($OFFER; $off_guid),          # service_offering_name
-          name_from($PLAN;  $plan_guid),         # service_plan_name
-          name_from($INST;  $si_guid),           # service_instance_name
-          ($si_guid // ""),                      # service_instance_guid
-          ($binding_guid // ""),                 # service_binding_guid
-          ($binding_name // ""),                 # binding_name
-          name_from($APP;   $app_guid),          # app_name
-          ($app_guid // ""),                     # app_guid
-          name_from($SPACE; $space_guid),        # space_name
-          ($space_guid // ""),                   # space_guid
-          name_from($ORG;   $org_guid),          # org_name
-          ($org_guid // ""),                     # org_guid
-          ($uri // ""),                          # credential_uri
-          (if $creds == {} then "" else ($creds | tojson) end) # credentials_json
+            | [
+          $BROKER,
+          "app",
+          name_from($OFFER; $off_guid),
+          name_from($PLAN;  $plan_guid),
+          name_from($INST;  $si_guid),
+          ($si_guid // ""),
+          ($binding_guid // ""),
+          ($binding_name // ""),
+          name_from($APP;   $app_guid),
+          ($app_guid // ""),
+          name_from($SPACE; $space_guid),
+          ($space_guid // ""),
+          name_from($ORG;   $org_guid),
+          ($org_guid // ""),
+          ($uri // ""),
+          (if $creds == {} then "" else ($creds | tojson) end)
         ]
-      | @tsv
+      | join("\u001F")
     ' <<<"$app_bindings" \
-    | while IFS= read -r tsv_line; do
-        process_binding_tsv_stream "$tsv_line"
+    | while IFS= read -r binding_line; do
+        process_binding_tsv_stream "$binding_line"
       done
 
     #######################################################################
@@ -1620,27 +1618,27 @@ run_service_bindings_phase() {
       | ($DET[0][$binding_guid].credentials? // {})       as $creds
       | ($creds.url // $creds.uri // $creds.connection // $creds.jdbcUrl // $creds.jdbc_url // "") as $uri
       | [
-          $BROKER,                               # broker_name
-          "key",                                 # binding_type
-          name_from($OFFER; $off_guid),          # service_offering_name
-          name_from($PLAN;  $plan_guid),         # service_plan_name
-          name_from($INST;  $si_guid),           # service_instance_name
-          ($si_guid // ""),                      # service_instance_guid
-          ($binding_guid // ""),                 # service_binding_guid
-          ($binding_name // ""),                 # binding_name
-          "",                                    # app_name (keys are not app‑scoped)
-          "",                                    # app_guid
-          name_from($SPACE; $space_guid),        # space_name
-          ($space_guid // ""),                   # space_guid
-          name_from($ORG;   $org_guid),          # org_name
-          ($org_guid // ""),                     # org_guid
-          ($uri // ""),                          # credential_uri
-          (if $creds == {} then "" else ($creds | tojson) end) # credentials_json
+          $BROKER,
+          "key",
+          name_from($OFFER; $off_guid),
+          name_from($PLAN;  $plan_guid),
+          name_from($INST;  $si_guid),
+          ($si_guid // ""),
+          ($binding_guid // ""),
+          ($binding_name // ""),
+          "",
+          "",
+          name_from($SPACE; $space_guid),
+          ($space_guid // ""),
+          name_from($ORG;   $org_guid),
+          ($org_guid // ""),
+          ($uri // ""),
+          (if $creds == {} then "" else ($creds | tojson) end)
         ]
-      | @tsv
+      | join("\u001F")
     ' <<<"$key_bindings" \
-    | while IFS= read -r tsv_line; do
-        process_binding_tsv_stream "$tsv_line"
+    | while IFS= read -r binding_line; do
+        process_binding_tsv_stream "$binding_line"
       done
 
     #######################################################################
@@ -1674,27 +1672,27 @@ run_service_bindings_phase() {
       | field_from($PLAN;  $plan_guid;  "offering_guid")   as $off_guid
       | field_from($SPACE; $space_guid; "org_guid")        as $org_guid
       | [
-          $BROKER,                               # broker_name
-          "none",                                # binding_type
-          name_from($OFFER; $off_guid),          # service_offering_name
-          name_from($PLAN;  $plan_guid),         # service_plan_name
-          $si_name,                              # service_instance_name
-          ($si_guid // ""),                      # service_instance_guid
-          "",                                    # service_binding_guid
-          "",                                    # binding_name
-          "",                                    # app_name
-          "",                                    # app_guid
-          name_from($SPACE; $space_guid),        # space_name
-          ($space_guid // ""),                   # space_guid
-          name_from($ORG;   $org_guid),          # org_name
-          ($org_guid // ""),                     # org_guid
-          "",                                    # credential_uri
-          ""                                     # credentials_json
+          $BROKER,
+          "none",
+          name_from($OFFER; $off_guid),
+          name_from($PLAN;  $plan_guid),
+          $si_name,
+          ($si_guid // ""),
+          "",
+          "",
+          "",
+          "",
+          name_from($SPACE; $space_guid),
+          ($space_guid // ""),
+          name_from($ORG;   $org_guid),
+          ($org_guid // ""),
+          "",
+          ""
         ]
-      | @tsv
+      | join("\u001F")
     ' <<<"$instances" \
-    | while IFS= read -r tsv_line; do
-        process_binding_tsv_stream "$tsv_line"
+    | while IFS= read -r binding_line; do
+        process_binding_tsv_stream "$binding_line"
       done
 
     rm -rf "$tmpdir"
