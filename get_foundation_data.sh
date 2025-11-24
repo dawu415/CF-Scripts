@@ -1335,137 +1335,6 @@ run_service_bindings_phase() {
   }
 
   # jq templates for transforming broker data into flat binding rows.
-  # Column order:
-  #   broker_name, binding_type, service_offering_name, service_plan_name,
-  #   service_instance_name, service_instance_guid, service_binding_guid,
-  #   binding_name, app_name, app_guid, space_name, space_guid,
-  #   org_name, org_guid, credential_uri, credentials_json
-
-  app_jq_script=$(cat <<'JQAPP'
-def name_from(m; k):
-  (m[0][k]? | .name? // "N/A");
-
-def field_from(m; k; f):
-  (m[0][k]? | .[f]?);
-
-.[] as $b
-| ($b.guid // "N/A") as $binding_guid
-| ($b.name // "")    as $binding_name
-| ($b.relationships.service_instance.data.guid? // null) as $si_guid
-| ($b.relationships.app.data.guid?              // null) as $app_guid
-| field_from($INST;  $si_guid;  "plan_guid")        as $plan_guid
-| field_from($INST;  $si_guid;  "space_guid")       as $space_guid
-| field_from($PLAN;  $plan_guid; "offering_guid")   as $off_guid
-| field_from($SPACE; $space_guid; "org_guid")       as $org_guid
-| ($DET[0][$binding_guid].credentials? // {})       as $creds
-| ($creds.url // $creds.uri // $creds.connection // $creds.jdbcUrl // $creds.jdbc_url // "") as $uri
-| [
-    $BROKER,                               # broker_name
-    "app",                                 # binding_type
-    name_from($OFFER; $off_guid),          # service_offering_name
-    name_from($PLAN;  $plan_guid),         # service_plan_name
-    name_from($INST;  $si_guid),           # service_instance_name
-    ($si_guid // ""),                      # service_instance_guid
-    ($binding_guid // ""),                 # service_binding_guid
-    ($binding_name // ""),                 # binding_name
-    name_from($APP;   $app_guid),          # app_name
-    ($app_guid // ""),                     # app_guid
-    name_from($SPACE; $space_guid),        # space_name
-    ($space_guid // ""),                   # space_guid
-    name_from($ORG;   $org_guid),          # org_name
-    ($org_guid // ""),                     # org_guid
-    ($uri // ""),                          # credential_uri
-    (if $creds == {} then "" else ($creds | tojson) end) # credentials_json
-  ]
-| @tsv
-JQAPP
-)
-
-  key_jq_script=$(cat <<'JQKEY'
-def name_from(m; k):
-  (m[0][k]? | .name? // "N/A");
-
-def field_from(m; k; f):
-  (m[0][k]? | .[f]?);
-
-.[] as $b
-| ($b.guid // "N/A") as $binding_guid
-| ($b.name // "")    as $binding_name
-| ($b.relationships.service_instance.data.guid? // null) as $si_guid
-| field_from($INST;  $si_guid;  "plan_guid")        as $plan_guid
-| field_from($INST;  $si_guid;  "space_guid")       as $space_guid
-| field_from($PLAN;  $plan_guid; "offering_guid")   as $off_guid
-| field_from($SPACE; $space_guid; "org_guid")       as $org_guid
-| ($DET[0][$binding_guid].credentials? // {})       as $creds
-| ($creds.url // $creds.uri // $creds.connection // $creds.jdbcUrl // $creds.jdbc_url // "") as $uri
-| [
-    $BROKER,                               # broker_name
-    "key",                                 # binding_type
-    name_from($OFFER; $off_guid),          # service_offering_name
-    name_from($PLAN;  $plan_guid),         # service_plan_name
-    name_from($INST;  $si_guid),           # service_instance_name
-    ($si_guid // ""),                      # service_instance_guid
-    ($binding_guid // ""),                 # service_binding_guid
-    ($binding_name // ""),                 # binding_name
-    "",                                    # app_name
-    "",                                    # app_guid
-    name_from($SPACE; $space_guid),        # space_name
-    ($space_guid // ""),                   # space_guid
-    name_from($ORG;   $org_guid),          # org_name
-    ($org_guid // ""),                     # org_guid
-    ($uri // ""),                          # credential_uri
-    (if $creds == {} then "" else ($creds | tojson) end) # credentials_json
-  ]
-| @tsv
-JQKEY
-)
-
-  unbound_jq_script=$(cat <<'JQUNB'
-def name_from(m; k):
-  (m[0][k]? | .name? // "N/A");
-
-def field_from(m; k; f):
-  (m[0][k]? | .[f]?);
-
-def bound_si_guids:
-  (($APPB[0] // []) + ($KEYB[0] // []))
-  | map(.relationships.service_instance.data.guid // empty)
-  | unique;
-
-(bound_si_guids) as $bound
-| .[] as $i
-| ($i.guid // "N/A")                  as $si_guid
-| ($i.name // "")                     as $si_name
-| select( $bound | index($si_guid) | not )
-| ($i.relationships.service_plan.data.guid? // null) as $plan_guid
-| ($i.relationships.space.data.guid?       // null)  as $space_guid
-| field_from($PLAN;  $plan_guid;  "offering_guid")   as $off_guid
-| field_from($SPACE; $space_guid; "org_guid")        as $org_guid
-| [
-    $BROKER,                               # broker_name
-    "none",                                # binding_type
-    name_from($OFFER; $off_guid),          # service_offering_name
-    name_from($PLAN;  $plan_guid),         # service_plan_name
-    $si_name,                              # service_instance_name
-    ($si_guid // ""),                      # service_instance_guid
-    "",                                    # service_binding_guid
-    "",                                    # binding_name
-    "",                                    # app_name
-    "",                                    # app_guid
-    name_from($SPACE; $space_guid),        # space_name
-    ($space_guid // ""),                   # space_guid
-    name_from($ORG;   $org_guid),          # org_name
-    ($org_guid // ""),                     # org_guid
-    "",                                    # credential_uri
-    ""                                     # credentials_json
-  ]
-| @tsv
-JQUNB
-)
-
-  # Make jq programs available to xargs workers
-  export app_jq_script key_jq_script unbound_jq_script
-
   ###########################################################################
   # Per-broker worker
   ###########################################################################
@@ -1577,7 +1446,9 @@ JQUNB
     printf '%s' "$app_bindings"   >"$app_bind_file"
     printf '%s' "$key_bindings"   >"$key_bind_file"
 
+    #######################################################################
     # App bindings → rows
+    #######################################################################
     jq -r \
       --arg BROKER "$broker_name" \
       --slurpfile OFFER "$offer_file" \
@@ -1586,8 +1457,43 @@ JQUNB
       --slurpfile APP   "$app_file" \
       --slurpfile SPACE "$space_file" \
       --slurpfile ORG   "$org_file" \
-      --slurpfile DET   "$det_app_file" \
-      "$app_jq_script" <<<"$app_bindings" \
+      --slurpfile DET   "$det_app_file" '
+      def name_from(m; k):
+        (m[0][k]? | .name? // "N/A");
+      def field_from(m; k; f):
+        (m[0][k]? | .[f]?);
+
+      .[] as $b
+      | ($b.guid // "N/A") as $binding_guid
+      | ($b.name // "")    as $binding_name
+      | ($b.relationships.service_instance.data.guid? // null) as $si_guid
+      | ($b.relationships.app.data.guid?              // null) as $app_guid
+      | field_from($INST;  $si_guid;  "plan_guid")        as $plan_guid
+      | field_from($INST;  $si_guid;  "space_guid")       as $space_guid
+      | field_from($PLAN;  $plan_guid; "offering_guid")   as $off_guid
+      | field_from($SPACE; $space_guid; "org_guid")       as $org_guid
+      | ($DET[0][$binding_guid].credentials? // {})       as $creds
+      | ($creds.url // $creds.uri // $creds.connection // $creds.jdbcUrl // $creds.jdbc_url // "") as $uri
+      | [
+          $BROKER,                               # broker_name
+          "app",                                 # binding_type
+          name_from($OFFER; $off_guid),          # service_offering_name
+          name_from($PLAN;  $plan_guid),         # service_plan_name
+          name_from($INST;  $si_guid),           # service_instance_name
+          ($si_guid // ""),                      # service_instance_guid
+          ($binding_guid // ""),                 # service_binding_guid
+          ($binding_name // ""),                 # binding_name
+          name_from($APP;   $app_guid),          # app_name
+          ($app_guid // ""),                     # app_guid
+          name_from($SPACE; $space_guid),        # space_name
+          ($space_guid // ""),                   # space_guid
+          name_from($ORG;   $org_guid),          # org_name
+          ($org_guid // ""),                     # org_guid
+          ($uri // ""),                          # credential_uri
+          (if $creds == {} then "" else ($creds | tojson) end) # credentials_json
+        ]
+      | @tsv
+    ' <<<"$app_bindings" \
     | while IFS=$'\t' read -r broker_name bt offer_name plan_name si_name si_guid binding_guid binding_name app_name app_guid space_name space_guid org_name org_guid cred_uri creds_json; do
         local redacted_uri redacted_creds
         redacted_uri=$(redact_credentials "$cred_uri")
@@ -1600,7 +1506,9 @@ JQUNB
           "$FOUNDATION_SLUG" "$BATCH_ID"
       done
 
+    #######################################################################
     # Key bindings → rows
+    #######################################################################
     jq -r \
       --arg BROKER "$broker_name" \
       --slurpfile OFFER "$offer_file" \
@@ -1608,8 +1516,42 @@ JQUNB
       --slurpfile INST  "$inst_file" \
       --slurpfile SPACE "$space_file" \
       --slurpfile ORG   "$org_file" \
-      --slurpfile DET   "$det_key_file" \
-      "$key_jq_script" <<<"$key_bindings" \
+      --slurpfile DET   "$det_key_file" '
+      def name_from(m; k):
+        (m[0][k]? | .name? // "N/A");
+      def field_from(m; k; f):
+        (m[0][k]? | .[f]?);
+
+      .[] as $b
+      | ($b.guid // "N/A") as $binding_guid
+      | ($b.name // "")    as $binding_name
+      | ($b.relationships.service_instance.data.guid? // null) as $si_guid
+      | field_from($INST;  $si_guid;  "plan_guid")        as $plan_guid
+      | field_from($INST;  $si_guid;  "space_guid")       as $space_guid
+      | field_from($PLAN;  $plan_guid; "offering_guid")   as $off_guid
+      | field_from($SPACE; $space_guid; "org_guid")       as $org_guid
+      | ($DET[0][$binding_guid].credentials? // {})       as $creds
+      | ($creds.url // $creds.uri // $creds.connection // $creds.jdbcUrl // $creds.jdbc_url // "") as $uri
+      | [
+          $BROKER,                               # broker_name
+          "key",                                 # binding_type
+          name_from($OFFER; $off_guid),          # service_offering_name
+          name_from($PLAN;  $plan_guid),         # service_plan_name
+          name_from($INST;  $si_guid),           # service_instance_name
+          ($si_guid // ""),                      # service_instance_guid
+          ($binding_guid // ""),                 # service_binding_guid
+          ($binding_name // ""),                 # binding_name
+          "",                                    # app_name (keys are not app‑scoped)
+          "",                                    # app_guid
+          name_from($SPACE; $space_guid),        # space_name
+          ($space_guid // ""),                   # space_guid
+          name_from($ORG;   $org_guid),          # org_name
+          ($org_guid // ""),                     # org_guid
+          ($uri // ""),                          # credential_uri
+          (if $creds == {} then "" else ($creds | tojson) end) # credentials_json
+        ]
+      | @tsv
+    ' <<<"$key_bindings" \
     | while IFS=$'\t' read -r broker_name bt offer_name plan_name si_name si_guid binding_guid binding_name app_name app_guid space_name space_guid org_name org_guid cred_uri creds_json; do
         local redacted_uri redacted_creds
         redacted_uri=$(redact_credentials "$cred_uri")
@@ -1622,7 +1564,9 @@ JQUNB
           "$FOUNDATION_SLUG" "$BATCH_ID"
       done
 
+    #######################################################################
     # Unbound instances → rows
+    #######################################################################
     jq -r \
       --arg BROKER "$broker_name" \
       --slurpfile OFFER "$offer_file" \
@@ -1631,8 +1575,45 @@ JQUNB
       --slurpfile SPACE "$space_file" \
       --slurpfile ORG   "$org_file" \
       --slurpfile APPB  "$app_bind_file" \
-      --slurpfile KEYB  "$key_bind_file" \
-      "$unbound_jq_script" <<<"$instances" \
+      --slurpfile KEYB  "$key_bind_file" '
+      def name_from(m; k):
+        (m[0][k]? | .name? // "N/A");
+      def field_from(m; k; f):
+        (m[0][k]? | .[f]?);
+      def bound_si_guids:
+        (($APPB[0] // []) + ($KEYB[0] // []))
+        | map(.relationships.service_instance.data.guid // empty)
+        | unique;
+
+      (bound_si_guids) as $bound
+      | .[] as $i
+      | ($i.guid // "N/A")                  as $si_guid
+      | ($i.name // "")                     as $si_name
+      | select( $bound | index($si_guid) | not )
+      | ($i.relationships.service_plan.data.guid? // null) as $plan_guid
+      | ($i.relationships.space.data.guid?       // null)  as $space_guid
+      | field_from($PLAN;  $plan_guid;  "offering_guid")   as $off_guid
+      | field_from($SPACE; $space_guid; "org_guid")        as $org_guid
+      | [
+          $BROKER,                               # broker_name
+          "none",                                # binding_type
+          name_from($OFFER; $off_guid),          # service_offering_name
+          name_from($PLAN;  $plan_guid),         # service_plan_name
+          $si_name,                              # service_instance_name
+          ($si_guid // ""),                      # service_instance_guid
+          "",                                    # service_binding_guid
+          "",                                    # binding_name
+          "",                                    # app_name
+          "",                                    # app_guid
+          name_from($SPACE; $space_guid),        # space_name
+          ($space_guid // ""),                   # space_guid
+          name_from($ORG;   $org_guid),          # org_name
+          ($org_guid // ""),                     # org_guid
+          "",                                    # credential_uri
+          ""                                     # credentials_json
+        ]
+      | @tsv
+    ' <<<"$instances" \
     | while IFS=$'\t' read -r broker_name bt offer_name plan_name si_name si_guid binding_guid binding_name app_name app_guid space_name space_guid org_name org_guid cred_uri creds_json; do
         local redacted_uri redacted_creds
         redacted_uri=$(redact_credentials "$cred_uri")
@@ -1647,19 +1628,6 @@ JQUNB
 
     rm -rf "$tmpdir"
   }
-
-  export -f get_all fetch_with_param_chunks parallel_get_objs parallel_get_binding_details_map \
-            process_broker csv_write_row redact_credentials
-
-  local brokers_json
-  brokers_json=$(fetch_all_pages_v3 "/v3/service_brokers")
-  mapfile -t BROKER_GUIDS < <(jq -r '.[].guid // empty' <<<"$brokers_json")
-
-  local BROKER_WORKERS="${BROKER_WORKERS:-3}"
-  if ((${#BROKER_GUIDS[@]})); then
-    printf '%s\n' "${BROKER_GUIDS[@]}" \
-      | xargs -n1 -P "$BROKER_WORKERS" bash -c 'process_broker "$1"' _
-  fi
 }
 
 ###############################################################################
