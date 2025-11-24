@@ -836,6 +836,12 @@ init_output_paths_and_headers() {
     "Foundation_Slug" "Batch_Id"
   )
 
+  # Total binding columns in the CSV (including Foundation_Slug + Batch_Id).
+  BINDINGS_COL_COUNT=${#BINDINGS_HEADER[@]}
+  # Columns produced by jq (@tsv) *before* we append Foundation_Slug + Batch_Id.
+  BINDING_TSV_COL_COUNT=$(( BINDINGS_COL_COUNT - 2 ))
+  export BINDINGS_COL_COUNT BINDING_TSV_COL_COUNT
+
   csv_write_header "$APP_DATA_OUT"        "${APP_HEADER[@]}"
   [[ -n "$SERVICE_DATA_OUT"     ]] && csv_write_header "$SERVICE_DATA_OUT"     "${SERVICE_HEADER[@]}"
   [[ -n "$DEVELOPER_DATA_OUT"   ]] && csv_write_header "$DEVELOPER_DATA_OUT"   "${DEVELOPER_HEADER[@]}"
@@ -1246,6 +1252,92 @@ run_developer_space_phase() {
 }
 
 # Phase 3: service bindings (all brokers)
+###############################################################################
+# Service binding TSV → CSV row normalizer
+###############################################################################
+process_binding_tsv_stream() {
+  local tsv_line="$1"
+
+  # Parse the TSV into an array of fields.
+  local -a cols
+  IFS=$'\t' read -r -a cols <<<"$tsv_line"
+
+  # Normalize to expected number of "core" binding columns (before Foundation_Slug/Batch_Id).
+  local expected="${BINDING_TSV_COL_COUNT:-16}"
+  local i
+  if ((${#cols[@]} < expected)); then
+    for ((i=${#cols[@]}; i<expected; i++)); do
+      cols[i]=""
+    done
+  elif ((${#cols[@]} > expected)); then
+    # Hard trim any accidental extras (defensive).
+    cols=("${cols[@]:0:expected}")
+  fi
+
+  # Map by index – this must match the order of the jq array:
+  # broker_name, binding_type, service_offering_name, service_plan_name,
+  # service_instance_name, service_instance_guid, service_binding_guid,
+  # binding_name, app_name, app_guid, space_name, space_guid,
+  # org_name, org_guid, credential_uri, credentials_json
+  local broker_name="${cols[0]}"
+  local bt="${cols[1]}"
+  local offer_name="${cols[2]}"
+  local plan_name="${cols[3]}"
+  local si_name="${cols[4]}"
+  local si_guid="${cols[5]}"
+  local binding_guid="${cols[6]}"
+  local binding_name="${cols[7]}"
+  local app_name="${cols[8]}"
+  local app_guid="${cols[9]}"
+  local space_name="${cols[10]}"
+  local space_guid="${cols[11]}"
+  local org_name="${cols[12]}"
+  local org_guid="${cols[13]}"
+  local cred_uri="${cols[14]}"
+  local creds_json="${cols[15]}"
+
+  ###########################################################################
+  # Enforce binding-type-specific semantics:
+  #
+  #  - none: unbound instance → MUST NOT have service_binding_guid,
+  #          binding_name, app_name, app_guid
+  #  - app:  app binding → may or may not have binding_name, but all
+  #          other fields should be populated if known.
+  #  - key:  service key → has binding_guid + binding_name, but no app_*.
+  ###########################################################################
+  case "$bt" in
+    none)
+      binding_guid=""
+      binding_name=""
+      app_name=""
+      app_guid=""
+      ;;
+    key)
+      # Keys are not app-scoped; app_* must be blank.
+      app_name=""
+      app_guid=""
+      ;;
+    app)
+      # If binding_name was missing in the API, it is already "" here.
+      :
+      ;;
+  esac
+
+  # Apply redaction rules to credential fields.
+  local redacted_uri redacted_creds
+  redacted_uri=$(redact_credentials "$cred_uri")
+  redacted_creds=$(redact_credentials "$creds_json")
+
+  # Finally, write a perfectly aligned CSV row.
+  csv_write_row "$SERVICE_BINDINGS_OUT" \
+    "$broker_name" "$bt" "$offer_name" "$plan_name" \
+    "$si_name" "$si_guid" "$binding_guid" "$binding_name" \
+    "$app_name" "$app_guid" "$space_name" "$space_guid" \
+    "$org_name" "$org_guid" "$redacted_uri" "$redacted_creds" \
+    "$FOUNDATION_SLUG" "$BATCH_ID"
+}
+export -f process_binding_tsv_stream
+
 run_service_bindings_phase() {
   [[ -z "$SERVICE_BINDINGS_OUT" ]] && return 0
 
@@ -1458,52 +1550,11 @@ run_service_bindings_phase() {
       --slurpfile SPACE "$space_file" \
       --slurpfile ORG   "$org_file" \
       --slurpfile DET   "$det_app_file" '
-      def name_from(m; k):
-        (m[0][k]? | .name? // "N/A");
-      def field_from(m; k; f):
-        (m[0][k]? | .[f]?);
-
-      .[] as $b
-      | ($b.guid // "N/A") as $binding_guid
-      | ($b.name // "")    as $binding_name
-      | ($b.relationships.service_instance.data.guid? // null) as $si_guid
-      | ($b.relationships.app.data.guid?              // null) as $app_guid
-      | field_from($INST;  $si_guid;  "plan_guid")        as $plan_guid
-      | field_from($INST;  $si_guid;  "space_guid")       as $space_guid
-      | field_from($PLAN;  $plan_guid; "offering_guid")   as $off_guid
-      | field_from($SPACE; $space_guid; "org_guid")       as $org_guid
-      | ($DET[0][$binding_guid].credentials? // {})       as $creds
-      | ($creds.url // $creds.uri // $creds.connection // $creds.jdbcUrl // $creds.jdbc_url // "") as $uri
-      | [
-          $BROKER,                               # broker_name
-          "app",                                 # binding_type
-          name_from($OFFER; $off_guid),          # service_offering_name
-          name_from($PLAN;  $plan_guid),         # service_plan_name
-          name_from($INST;  $si_guid),           # service_instance_name
-          ($si_guid // ""),                      # service_instance_guid
-          ($binding_guid // ""),                 # service_binding_guid
-          ($binding_name // ""),                 # binding_name
-          name_from($APP;   $app_guid),          # app_name
-          ($app_guid // ""),                     # app_guid
-          name_from($SPACE; $space_guid),        # space_name
-          ($space_guid // ""),                   # space_guid
-          name_from($ORG;   $org_guid),          # org_name
-          ($org_guid // ""),                     # org_guid
-          ($uri // ""),                          # credential_uri
-          (if $creds == {} then "" else ($creds | tojson) end) # credentials_json
-        ]
+      ...
       | @tsv
     ' <<<"$app_bindings" \
-    | while IFS=$'\t' read -r broker_name bt offer_name plan_name si_name si_guid binding_guid binding_name app_name app_guid space_name space_guid org_name org_guid cred_uri creds_json; do
-        local redacted_uri redacted_creds
-        redacted_uri=$(redact_credentials "$cred_uri")
-        redacted_creds=$(redact_credentials "$creds_json")
-        csv_write_row "$SERVICE_BINDINGS_OUT" \
-          "$broker_name" "$bt" "$offer_name" "$plan_name" \
-          "$si_name" "$si_guid" "$binding_guid" "$binding_name" \
-          "$app_name" "$app_guid" "$space_name" "$space_guid" \
-          "$org_name" "$org_guid" "$redacted_uri" "$redacted_creds" \
-          "$FOUNDATION_SLUG" "$BATCH_ID"
+    | while IFS= read -r tsv_line; do
+        process_binding_tsv_stream "$tsv_line"
       done
 
     #######################################################################
@@ -1552,16 +1603,8 @@ run_service_bindings_phase() {
         ]
       | @tsv
     ' <<<"$key_bindings" \
-    | while IFS=$'\t' read -r broker_name bt offer_name plan_name si_name si_guid binding_guid binding_name app_name app_guid space_name space_guid org_name org_guid cred_uri creds_json; do
-        local redacted_uri redacted_creds
-        redacted_uri=$(redact_credentials "$cred_uri")
-        redacted_creds=$(redact_credentials "$creds_json")
-        csv_write_row "$SERVICE_BINDINGS_OUT" \
-          "$broker_name" "$bt" "$offer_name" "$plan_name" \
-          "$si_name" "$si_guid" "$binding_guid" "$binding_name" \
-          "$app_name" "$app_guid" "$space_name" "$space_guid" \
-          "$org_name" "$org_guid" "$redacted_uri" "$redacted_creds" \
-          "$FOUNDATION_SLUG" "$BATCH_ID"
+    | while IFS= read -r tsv_line; do
+        process_binding_tsv_stream "$tsv_line"
       done
 
     #######################################################################
@@ -1614,23 +1657,15 @@ run_service_bindings_phase() {
         ]
       | @tsv
     ' <<<"$instances" \
-    | while IFS=$'\t' read -r broker_name bt offer_name plan_name si_name si_guid binding_guid binding_name app_name app_guid space_name space_guid org_name org_guid cred_uri creds_json; do
-        local redacted_uri redacted_creds
-        redacted_uri=$(redact_credentials "$cred_uri")
-        redacted_creds=$(redact_credentials "$creds_json")
-        csv_write_row "$SERVICE_BINDINGS_OUT" \
-          "$broker_name" "$bt" "$offer_name" "$plan_name" \
-          "$si_name" "$si_guid" "$binding_guid" "$binding_name" \
-          "$app_name" "$app_guid" "$space_name" "$space_guid" \
-          "$org_name" "$org_guid" "$redacted_uri" "$redacted_creds" \
-          "$FOUNDATION_SLUG" "$BATCH_ID"
+    | while IFS= read -r tsv_line; do
+        process_binding_tsv_stream "$tsv_line"
       done
 
     rm -rf "$tmpdir"
   }
-  
+
   export -f get_all fetch_with_param_chunks parallel_get_objs parallel_get_binding_details_map \
-            process_broker csv_write_row redact_credentials
+            process_broker csv_write_row redact_credentials process_binding_tsv_stream
 
   local brokers_json
   brokers_json=$(fetch_all_pages_v3 "/v3/service_brokers")
