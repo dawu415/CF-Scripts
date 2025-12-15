@@ -398,6 +398,7 @@ function Get-RemoteScriptDetached {
     [string]$RemoteRunDir,
     [string]$PlatformName,
     [string]$Api,
+    [string]$RunTag,
     [string]$EnvBlock = "",
     [string]$SourceCmd = "",
     [string[]]$Commands = $null,
@@ -427,6 +428,7 @@ cd '{{REMOTE_DIR}}'
 mkdir -p outputs/{{PLATFORM}}
 umask 077
 
+export BATCH_ID={{RUN_TAG}}
 export CF_ORCH_RUN_DIR='{{REMOTE_DIR}}'
 export CF_ORCH_PLATFORM='{{PLATFORM}}'
 export CF_ORCH_OUT_DIR='{{REMOTE_DIR}}/outputs/{{PLATFORM}}'
@@ -469,7 +471,8 @@ fi
 __RUN__
 '@
 
-  $tmpl = $tmpl.Replace('{{ENV_BLOCK}}', $EnvBlock).
+  $tmpl = $tmpl.Replace('{{RUN_TAG}}', $RunTag).
+                Replace('{{ENV_BLOCK}}', $EnvBlock).
                 Replace('{{SOURCE_CMD}}', $SourceCmd).
                 Replace('{{REMOTE_DIR}}', $RemoteRunDir).
                 Replace('{{PLATFORM}}', $PlatformName).
@@ -837,7 +840,7 @@ if (-not $Resume) {
 
         $cfSession = "sess-$RunTag-$PID-$([Guid]::NewGuid().ToString('N').Substring(0,8))"
 
-        $script = Get-RemoteScriptDetached -RemoteRunDir $remoteRunDir -PlatformName $platformName -Api $api -EnvBlock $envBlock -SourceCmd $sourceCmd -Commands $commandsToRun  -CfSession $cfSession 
+        $script = Get-RemoteScriptDetached -RemoteRunDir $remoteRunDir -PlatformName $platformName -Api $api -RunTag $RunTag -EnvBlock $envBlock -SourceCmd $sourceCmd -Commands $commandsToRun  -CfSession $cfSession 
 
         if ($DebugLaunch -or $ShowLaunchScript) {
           $safe = Redact-Secrets $script
