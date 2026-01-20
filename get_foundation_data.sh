@@ -772,10 +772,12 @@ export -f derive_uaa_from_cf_api get_cf_oauth_token scim_supports_or_filter buil
 write_role_membership_data_v3_fast() {
   [[ -z "${ROLE_MEMBERSHIP_OUT:-}" ]] && return 0
 
-  echo "Building role_membership_data via /v3/roles (FAST)..." >&2
+  echo "Building role_membership_data via /v3/roles (FAST, reusing v3_user_map)..." >&2
 
-  # Only the role types you care about:
-  local types="space_developer,space_manager,space_auditor,organization_manager,organization_billing_manager,organization_auditor"
+  local types="space_developer,space_manager,space_auditor,space_supporter,organization_manager,organization_billing_manager,organization_auditor,organization_user"
+
+  # Shared map file written by build_space_dev_cache()
+  local USER_MAP_FILE="$WORK_DIR/v3_user_map.json"
 
   # 1) Pull roles (paginated)
   local roles_json
@@ -785,30 +787,60 @@ write_role_membership_data_v3_fast() {
     return 0
   fi
 
-  # 2) Extract unique user guids from roles
-  mapfile -t USER_GUIDS < <(
-    jq -r '.[].relationships.user.data.guid // empty' <<<"$roles_json" | sort -u
-  )
-
-  # 3) Fetch /v3/users in chunks to get username
-  local users_json='[]'
-  if ((${#USER_GUIDS[@]})); then
-    local user_chunk="${V3_USER_CHUNK_SIZE:-80}"
-    if ! [[ "$user_chunk" =~ ^[1-9][0-9]*$ ]]; then user_chunk=80; fi
-    users_json="$(fetch_v3_with_param_chunks "/v3/users" "guids" "$user_chunk" "${USER_GUIDS[@]}")"
+  # 2) Load existing user map (may be empty)
+  local user_map='{}'
+  if [[ -s "$USER_MAP_FILE" ]]; then
+    user_map="$(cat "$USER_MAP_FILE")"
+    # Ensure valid JSON
+    if ! jq -e . >/dev/null 2>&1 <<<"$user_map"; then
+      user_map='{}'
+    fi
   fi
 
-  # Build user_guid -> username map
-  local user_map
-  user_map="$(jq -c 'map({key:.guid, value:(.username // "")}) | from_entries' <<<"$users_json" 2>/dev/null || echo '{}')"
+  # 3) Find missing user GUIDs not in map
+  mapfile -t all_user_guids < <(
+    jq -r '.[].relationships.user.data.guid // empty' <<<"$roles_json" | awk 'NF' | sort -u
+  )
 
-  # 4) Prepare org/space lookup maps from your existing v2 caches (FAST, no calls)
+  # Compute missing list using jq against the current map
+  local missing_file="$WORK_DIR/.missing_user_guids.txt"
+  : >"$missing_file"
+  if ((${#all_user_guids[@]})); then
+    printf '%s\n' "${all_user_guids[@]}" \
+      | jq -R 'select(length>0)' \
+      | jq -s --argjson m "$user_map" '
+          map(select(($m[.] // "") == "")) | .[]
+        ' >"$missing_file" 2>/dev/null || true
+  fi
+
+  # 4) Fetch /v3/users only for missing GUIDs and merge into map
+  if [[ -s "$missing_file" ]]; then
+    mapfile -t missing_guids < <(awk 'NF' "$missing_file")
+    if ((${#missing_guids[@]})); then
+      local user_chunk="${V3_USER_CHUNK_SIZE:-120}"
+      if ! [[ "$user_chunk" =~ ^[1-9][0-9]*$ ]]; then user_chunk=120; fi
+
+      local missing_users_json
+      missing_users_json="$(fetch_v3_with_param_chunks "/v3/users" "guids" "$user_chunk" "${missing_guids[@]}")"
+
+      local missing_map
+      missing_map="$(jq -c 'map({key:.guid, value:((.username // "") | ascii_downcase)}) | from_entries' <<<"$missing_users_json" 2>/dev/null || echo '{}')"
+
+      # Merge: existing user_map * missing_map (missing wins but shouldn’t conflict)
+      user_map="$(jq -c --argjson a "$user_map" --argjson b "$missing_map" '$a * $b' <<<"{}" 2>/dev/null || echo "$user_map")"
+
+      # Persist merged map for any later use
+      printf '%s' "$user_map" >"$USER_MAP_FILE"
+    fi
+  fi
+
+  # 5) Prepare org/space lookup maps from your existing v2 caches (FAST, no calls)
   local org_name_map space_name_map space_org_map
   org_name_map="$(jq -c '(.resources // []) | map({key:.metadata.guid, value:(.entity.name // "")}) | from_entries' "$ORGS_JSON_FILE" 2>/dev/null || echo '{}')"
   space_name_map="$(jq -c '(.resources // []) | map({key:.metadata.guid, value:(.entity.name // "")}) | from_entries' "$SPACES_JSON_FILE" 2>/dev/null || echo '{}')"
   space_org_map="$(jq -c '(.resources // []) | map({key:.metadata.guid, value:(.entity.organization_guid // "")}) | from_entries' "$SPACES_JSON_FILE" 2>/dev/null || echo '{}')"
 
-  # 5) Pass 1: build row stubs + username list
+  # 6) Pass 1: build row stubs + username list
   local US=$'\x1F'
   local tmp_rows="$WORK_DIR/role_rows.usv"
   local tmp_users="$WORK_DIR/role_users.txt"
@@ -817,21 +849,18 @@ write_role_membership_data_v3_fast() {
   : >"$tmp_rows"
   : >"$tmp_users"
 
-  # Dedup role rows: roles can overlap and /v3/roles might include duplicates in odd cases
   declare -A SEEN_ROW
 
-  # Emit lines with: stable_key, foundation_slug, org_name, space_name, env..., scope, role, username, batch
-  # Then we bulk enrich username -> email.
   while IFS= read -r r; do
     local type user_guid username scope org_guid space_guid org_name space_name stable_key role_norm
 
     type="$(jq -r '.type // ""' <<<"$r")"
     user_guid="$(jq -r '.relationships.user.data.guid // ""' <<<"$r")"
-    # jq trick above is messy in bash; do it cleanly using jq against user_map:
+
     username="$(jq -r --arg ug "$user_guid" '.[$ug] // ""' <<<"$user_map" 2>/dev/null || true)"
     username="${username,,}"
+    [[ -z "$username" ]] && continue
 
-    # Determine scope + target GUIDs
     case "$type" in
       space_developer|space_manager|space_auditor|space_supporter)
         scope="space"
@@ -844,13 +873,11 @@ write_role_membership_data_v3_fast() {
         space_guid=""
         ;;
       *)
-        # ignore role types you didn't ask for
         continue
         ;;
     esac
 
     [[ -z "$org_guid" && -z "$space_guid" ]] && continue
-    [[ -z "$username" ]] && continue
 
     org_name="$(jq -r --arg og "$org_guid" '.[$og] // ""' <<<"$org_name_map" 2>/dev/null || true)"
     space_name=""
@@ -858,10 +885,8 @@ write_role_membership_data_v3_fast() {
       space_name="$(jq -r --arg sg "$space_guid" '.[$sg] // ""' <<<"$space_name_map" 2>/dev/null || true)"
     fi
 
-    # Stable key convention: same as you use elsewhere
     stable_key="${FOUNDATION_SLUG}:${org_name}:${space_name}"
 
-    # Normalize role label to match your earlier naming
     case "$type" in
       space_developer) role_norm="SPACE_DEVELOPER" ;;
       space_manager) role_norm="SPACE_MANAGER" ;;
@@ -874,24 +899,20 @@ write_role_membership_data_v3_fast() {
       *) role_norm="$type" ;;
     esac
 
-    # Dedup key
     local dk="${stable_key}|${scope}|${role_norm}|${username}|${BATCH_ID}"
-    if [[ -n "${SEEN_ROW[$dk]:-}" ]]; then
-      continue
-    fi
+    [[ -n "${SEEN_ROW[$dk]:-}" ]] && continue
     SEEN_ROW["$dk"]=1
 
-    [[ -n "$username" ]] && printf '%s\n' "$username" >>"$tmp_users"
+    printf '%s\n' "$username" >>"$tmp_users"
     printf '%s\n' "${stable_key}${US}${FOUNDATION_SLUG}${US}${org_name}${US}${space_name}${US}${ENV_LOCATION}${US}${ENV_TYPE}${US}${ENV_DATACENTER}${US}${scope}${US}${role_norm}${US}${username}${US}${BATCH_ID}" >>"$tmp_rows"
   done < <(jq -rc '.[]' <<<"$roles_json")
 
-  # If nothing to write, stop
   if [[ ! -s "$tmp_rows" ]]; then
     echo "No role rows produced after filtering/join; skipping." >&2
     return 0
   fi
 
-  # 6) Bulk resolve emails (fast)
+  # 7) Bulk resolve emails (dedup usernames first)
   sort -u "$tmp_users" -o "$tmp_users"
 
   UAA_BASE_URL="$(derive_uaa_from_cf_api)"
@@ -905,7 +926,7 @@ write_role_membership_data_v3_fast() {
     echo "WARNING: No UAA_BASE_URL or CF_OAUTH_TOKEN; Email column will be blank." >&2
   fi
 
-  # 7) Write CSV (no network calls here)
+  # 8) Write CSV (no network calls here)
   while IFS=$'\x1F' read -r stable_key foundation_slug org_name space_name env_loc env_type env_dc scope role user batch; do
     local email=""
     if [[ "$user" == *"@"* ]]; then
@@ -983,12 +1004,15 @@ preload_foundation_metadata() {
 
 ###############################################################################
 # Build SPACE_GUID → colon-separated list of developer usernames (FAST via v3 roles)
-# Output format matches existing consumers:
-#   SPACE_DEVS_JSON_FILE = { "<space_guid>": "user1:user2:user3", ... }
+# Also persists a shared v3 user map (user_guid -> username lowercase) to WORK_DIR.
 ###############################################################################
 build_space_dev_cache() {
   local out="$SPACE_DEVS_JSON_FILE"
   local tmp; tmp="$(mktemp "${CACHE_ROOT%/}/.space_devs.tmp.XXXXXX")"
+
+  # Where we persist the shared map for later phases
+  local USER_MAP_FILE="$WORK_DIR/v3_user_map.json"
+  local USER_GUIDS_FILE="$WORK_DIR/v3_user_guids.txt"
 
   # Spaces referenced by apps in this run
   mapfile -t space_guids < <(
@@ -1001,27 +1025,22 @@ build_space_dev_cache() {
   if ((${#space_guids[@]} == 0)); then
     echo '{}' >"$tmp"
     mv -f "$tmp" "$out"
+    echo '{}' >"$USER_MAP_FILE"
+    : >"$USER_GUIDS_FILE"
     return
   fi
 
   echo "Preloading developers for ${#space_guids[@]} spaces (FAST via /v3/roles)..." >&2
 
-  # --------------------------------------------------------------------------
-  # 1) Pull space_developer roles (attempt space_guids filter; fallback to all)
-  # --------------------------------------------------------------------------
+  # 1) Pull space_developer roles (try space_guids filter; fallback to all)
   local roles_json='[]'
-
-  # Probe whether this foundation supports space_guids filter on /v3/roles
   local probe
   probe="$(cf curl "/v3/roles?types=space_developer&space_guids=${space_guids[0]}&per_page=1" 2>/dev/null || echo '{}')"
 
   if jq -e '.resources? | type=="array"' >/dev/null 2>&1 <<<"$probe"; then
-    # Supported: fetch roles for our spaces in chunks (fastest)
     local role_space_chunk="${V3_ROLE_SPACE_CHUNK_SIZE:-80}"
     if ! [[ "$role_space_chunk" =~ ^[1-9][0-9]*$ ]]; then role_space_chunk=80; fi
 
-    # Fetch chunked: /v3/roles?types=space_developer&space_guids=a,b,c...
-    # Use a local loop because fetch_all_pages_v3 expects a path string.
     {
       local -a chunk=()
       local sg
@@ -1041,11 +1060,9 @@ build_space_dev_cache() {
 
     roles_json="$(cat "$WORK_DIR/.space_dev_roles.json")"
   else
-    # Fallback: fetch all space_developer roles and filter locally to our spaces
     local all_roles
     all_roles="$(fetch_all_pages_v3 "/v3/roles?types=space_developer")"
 
-    # Build wanted set: { "<space_guid>": true, ... }
     local wanted_json
     wanted_json="$(printf '%s\n' "${space_guids[@]}" \
       | jq -R 'select(length>0)' \
@@ -1059,15 +1076,17 @@ build_space_dev_cache() {
   if [[ -z "$roles_json" || "$roles_json" == "null" || "$(jq 'length' <<<"$roles_json")" -eq 0 ]]; then
     echo '{}' >"$tmp"
     mv -f "$tmp" "$out"
+    echo '{}' >"$USER_MAP_FILE"
+    : >"$USER_GUIDS_FILE"
     return
   fi
 
-  # --------------------------------------------------------------------------
   # 2) Fetch usernames for role user GUIDs using /v3/users?guids=...
-  # --------------------------------------------------------------------------
   mapfile -t user_guids < <(
     jq -r '.[].relationships.user.data.guid // empty' <<<"$roles_json" | awk 'NF' | sort -u
   )
+
+  printf '%s\n' "${user_guids[@]}" >"$USER_GUIDS_FILE"
 
   local users_json='[]'
   if ((${#user_guids[@]})); then
@@ -1076,15 +1095,12 @@ build_space_dev_cache() {
     users_json="$(fetch_v3_with_param_chunks "/v3/users" "guids" "$user_chunk" "${user_guids[@]}")"
   fi
 
-  # Build map: user_guid -> username (lowercase)
+  # Build + persist map: user_guid -> username (lowercase)
   local user_map
-  user_map="$(jq -c '
-    map({key:.guid, value:((.username // "") | ascii_downcase)}) | from_entries
-  ' <<<"$users_json" 2>/dev/null || echo '{}')"
+  user_map="$(jq -c 'map({key:.guid, value:((.username // "") | ascii_downcase)}) | from_entries' <<<"$users_json" 2>/dev/null || echo '{}')"
+  printf '%s' "$user_map" >"$USER_MAP_FILE"
 
-  # --------------------------------------------------------------------------
   # 3) Build SPACE_GUID -> "u1:u2:u3" map and write to SPACE_DEVS_JSON_FILE
-  # --------------------------------------------------------------------------
   jq -c --argjson umap "$user_map" '
     reduce .[] as $r ({}; 
       ($r.relationships.space.data.guid // "") as $sg
