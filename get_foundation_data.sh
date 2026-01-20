@@ -981,71 +981,127 @@ preload_foundation_metadata() {
 # Lookups & Developer Cache
 ###############################################################################
 
-# Build a simple map: SPACE_GUID → colon-separated list of usernames
-# This is used by:
-#   - process_app()     → to compute per-app Developer_Count and Developers column
-#   - write_developer_space_data() → normalized per-space developer CSV
+###############################################################################
+# Build SPACE_GUID → colon-separated list of developer usernames (FAST via v3 roles)
+# Output format matches existing consumers:
+#   SPACE_DEVS_JSON_FILE = { "<space_guid>": "user1:user2:user3", ... }
+###############################################################################
 build_space_dev_cache() {
   local out="$SPACE_DEVS_JSON_FILE"
   local tmp; tmp="$(mktemp "${CACHE_ROOT%/}/.space_devs.tmp.XXXXXX")"
 
-  # Collect unique space URLs for spaces that actually have apps in this run
-  mapfile -t space_urls < <(
-    jq -r '.resources[]?.entity.space_url // empty' "$APPS_JSON_FILE" | sort -u
+  # Spaces referenced by apps in this run
+  mapfile -t space_guids < <(
+    jq -r '.resources[]?.entity.space_url // empty' "$APPS_JSON_FILE" \
+      | awk -F/ 'NF{print $NF}' \
+      | awk 'NF' \
+      | sort -u
   )
 
-  if ((${#space_urls[@]} == 0)); then
+  if ((${#space_guids[@]} == 0)); then
     echo '{}' >"$tmp"
     mv -f "$tmp" "$out"
     return
   fi
 
-  echo "Preloading developers for ${#space_urls[@]} spaces..." >&2
+  echo "Preloading developers for ${#space_guids[@]} spaces (FAST via /v3/roles)..." >&2
 
-  local td; td="$(mktemp -d "${CACHE_ROOT%/}/.space_devs_parts.XXXXXX")"
-  local workers="${SPACE_DEV_WORKERS:-8}"
-  if ! [[ "$workers" =~ ^[1-9][0-9]*$ ]]; then
-    workers=4
-  fi
+  # --------------------------------------------------------------------------
+  # 1) Pull space_developer roles (attempt space_guids filter; fallback to all)
+  # --------------------------------------------------------------------------
+  local roles_json='[]'
 
-  local current=0
-  declare -a pids=()
+  # Probe whether this foundation supports space_guids filter on /v3/roles
+  local probe
+  probe="$(cf curl "/v3/roles?types=space_developer&space_guids=${space_guids[0]}&per_page=1" 2>/dev/null || echo '{}')"
 
-  for url in "${space_urls[@]}"; do
-    (
-      sg="${url##*/}"
-      devs=$(
-        cf curl "${url}/developers" 2>/dev/null \
-          | jq -r '.resources[]?.entity.username // empty' \
-          | awk 'NF' \
-          | paste -sd ':' - \
-          || true
-      )
-      jq -n --arg gid "$sg" --arg devs "$devs" '{ ($gid): $devs }' \
-        >"$td/${sg}.json"
-    ) &
-    pids+=($!)
-    ((++current))
-    if (( current >= workers )); then
-      wait -n 2>/dev/null || true
-      ((--current))
-    fi
-  done
+  if jq -e '.resources? | type=="array"' >/dev/null 2>&1 <<<"$probe"; then
+    # Supported: fetch roles for our spaces in chunks (fastest)
+    local role_space_chunk="${V3_ROLE_SPACE_CHUNK_SIZE:-80}"
+    if ! [[ "$role_space_chunk" =~ ^[1-9][0-9]*$ ]]; then role_space_chunk=80; fi
 
-  for pid in "${pids[@]}"; do
-    wait "$pid" 2>/dev/null || true
-  done
+    # Fetch chunked: /v3/roles?types=space_developer&space_guids=a,b,c...
+    # Use a local loop because fetch_all_pages_v3 expects a path string.
+    {
+      local -a chunk=()
+      local sg
+      for sg in "${space_guids[@]}"; do
+        chunk+=( "$sg" )
+        if ((${#chunk[@]} >= role_space_chunk)); then
+          local csv; printf -v csv '%s,' "${chunk[@]}"; csv="${csv%,}"
+          fetch_all_pages_v3 "/v3/roles?types=space_developer&space_guids=${csv}" | jq -rc '.[]' 2>/dev/null || true
+          chunk=()
+        fi
+      done
+      if ((${#chunk[@]})); then
+        local csv; printf -v csv '%s,' "${chunk[@]}"; csv="${csv%,}"
+        fetch_all_pages_v3 "/v3/roles?types=space_developer&space_guids=${csv}" | jq -rc '.[]' 2>/dev/null || true
+      fi
+    } | jq -s '[.[]]' >"$WORK_DIR/.space_dev_roles.json"
 
-  if compgen -G "$td/*.json" >/dev/null 2>&1; then
-    jq -s 'reduce .[] as $o ({}; . * $o)' "$td"/*.json >"$tmp" 2>/dev/null \
-      || echo '{}' >"$tmp"
+    roles_json="$(cat "$WORK_DIR/.space_dev_roles.json")"
   else
-    echo '{}' >"$tmp"
+    # Fallback: fetch all space_developer roles and filter locally to our spaces
+    local all_roles
+    all_roles="$(fetch_all_pages_v3 "/v3/roles?types=space_developer")"
+
+    # Build wanted set: { "<space_guid>": true, ... }
+    local wanted_json
+    wanted_json="$(printf '%s\n' "${space_guids[@]}" \
+      | jq -R 'select(length>0)' \
+      | jq -s 'map({key:., value:true}) | from_entries')"
+
+    roles_json="$(jq -c --argjson wanted "$wanted_json" '
+      map(select((.relationships.space.data.guid // "") as $sg | ($wanted[$sg] // false)))
+    ' <<<"$all_roles" 2>/dev/null || echo '[]')"
   fi
 
-  rm -rf "$td"
+  if [[ -z "$roles_json" || "$roles_json" == "null" || "$(jq 'length' <<<"$roles_json")" -eq 0 ]]; then
+    echo '{}' >"$tmp"
+    mv -f "$tmp" "$out"
+    return
+  fi
+
+  # --------------------------------------------------------------------------
+  # 2) Fetch usernames for role user GUIDs using /v3/users?guids=...
+  # --------------------------------------------------------------------------
+  mapfile -t user_guids < <(
+    jq -r '.[].relationships.user.data.guid // empty' <<<"$roles_json" | awk 'NF' | sort -u
+  )
+
+  local users_json='[]'
+  if ((${#user_guids[@]})); then
+    local user_chunk="${V3_USER_CHUNK_SIZE:-120}"
+    if ! [[ "$user_chunk" =~ ^[1-9][0-9]*$ ]]; then user_chunk=120; fi
+    users_json="$(fetch_v3_with_param_chunks "/v3/users" "guids" "$user_chunk" "${user_guids[@]}")"
+  fi
+
+  # Build map: user_guid -> username (lowercase)
+  local user_map
+  user_map="$(jq -c '
+    map({key:.guid, value:((.username // "") | ascii_downcase)}) | from_entries
+  ' <<<"$users_json" 2>/dev/null || echo '{}')"
+
+  # --------------------------------------------------------------------------
+  # 3) Build SPACE_GUID -> "u1:u2:u3" map and write to SPACE_DEVS_JSON_FILE
+  # --------------------------------------------------------------------------
+  jq -c --argjson umap "$user_map" '
+    reduce .[] as $r ({}; 
+      ($r.relationships.space.data.guid // "") as $sg
+      | ($r.relationships.user.data.guid // "") as $ug
+      | ( ($umap[$ug] // "") ) as $u
+      | if ($sg == "" or $u == "") then .
+        else
+          .[$sg] = ((.[ $sg ] // []) + [$u])
+        end
+    )
+    | with_entries(.value |= (unique | sort | join(":")))
+  ' <<<"$roles_json" >"$tmp" 2>/dev/null || echo '{}' >"$tmp"
+
   mv -f "$tmp" "$out"
 }
+
+export -f build_space_dev_cache
 
 get_buildpack_filename() {
   local bp_key="$1" stack_name="${2:-}" out=""
