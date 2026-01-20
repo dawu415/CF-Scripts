@@ -628,6 +628,79 @@ scim_supports_or_filter() {
   [[ "$code" == "200" ]]
 }
 
+# Worker: process one chunk file of usernames using SCIM OR filter
+process_uaa_scim_chunk_or() {
+  set -euo pipefail
+  local chunk="$1" workdir="$2" uaa="$3" token="$4"
+
+  local filter="" u
+  while IFS= read -r u; do
+    [[ -z "$u" ]] && continue
+
+    # normalize username
+    u="${u,,}"
+    u="${u//$'\r'/}"
+    u="${u//$'\n'/}"
+    u="${u//\"/\\\"}"   # escape quotes for SCIM filter
+
+    [[ -n "$filter" ]] && filter+=" or "
+    filter+="userName eq \"${u}\""
+  done <"$chunk"
+
+  # URL-encode SCIM filter
+  local enc
+  enc="$(printf "%s" "$filter" | jq -sRr @uri)"
+
+  # Query UAA SCIM
+  local resp
+  resp="$(curl -sS -k \
+    -H "Authorization: ${token}" \
+    -H "Accept: application/json" \
+    "${uaa}/Users?filter=${enc}&startIndex=1&count=1000" 2>/dev/null || echo "{}")"
+
+  # Emit partial map: keys lowercased
+  jq -c '
+    reduce (.resources // [])[] as $r ({}; 
+      .[($r.userName // "" | ascii_downcase)] =
+        ((($r.emails[0].value // $r.emails[0] // "") | tostring))
+    )
+  ' <<<"$resp" >"$workdir/part.$(basename "$chunk").json"
+}
+
+# Worker: per-user SCIM lookup (fallback mode)
+process_uaa_scim_user_single() {
+  set -euo pipefail
+  local user="$1" workdir="$2" uaa="$3" token="$4"
+
+  user="${user,,}"
+  user="${user//$'\r'/}"
+  user="${user//$'\n'/}"
+  [[ -z "$user" ]] && exit 0
+
+  # If username already looks like email, map to itself (lowercase)
+  if [[ "$user" == *"@"* ]]; then
+    jq -n --arg u "$user" --arg e "$user" '{($u):$e}' >"$workdir/part.$$.json"
+    exit 0
+  fi
+
+  local f
+  f="$(printf 'userName eq "%s"' "${user//\"/\\\"}" | jq -sRr @uri)"
+
+  local resp
+  resp="$(curl -sS -k \
+    -H "Authorization: ${token}" \
+    -H "Accept: application/json" \
+    "${uaa}/Users?filter=${f}&startIndex=1&count=1" 2>/dev/null || echo "{}")"
+
+  local email
+  email="$(jq -r 'try (.resources[0].emails[0].value // .resources[0].emails[0] // "") catch ""' <<<"$resp" 2>/dev/null || true)"
+  email="${email,,}"
+
+  jq -n --arg u "$user" --arg e "$email" '{($u):$e}' >"$workdir/part.$$.json"
+}
+
+export -f process_uaa_scim_chunk_or process_uaa_scim_user_single
+
 # Build JSON map: { "username": "email", ... }
 build_uaa_email_map_fast() {
   local users_file="$1"
@@ -654,65 +727,37 @@ build_uaa_email_map_fast() {
 
   local workdir
   workdir="$(mktemp -d "${WORK_DIR%/}/uaa_email_parts.XXXXXX")"
+  
+  local users_norm="$workdir/users.norm"
+  awk 'NF{gsub(/^[ \t]+|[ \t]+$/,""); print tolower($0)}' "$users_file" | tr -d '\r' | sort -u >"$users_norm"
 
   if [[ "$supports_or" == "1" ]]; then
-    split -l "$chunk_size" -d -a 4 --additional-suffix=.chunk "$users_file" "$workdir/u."
+    # Build chunk files (one username per line)
+    split -l "$chunk_size" -d -a 4 --additional-suffix=.chunk "$users_norm" "$workdir/u."
 
-ls -1 "$workdir"/u.*.chunk 2>/dev/null \
-  | xargs -n1 -P "$workers" bash -c '
-      set -euo pipefail
-      chunk="$1"; workdir="$2"; uaa="$3"; token="$4"
+    # Process each chunk in parallel using exported function
+    if compgen -G "$workdir/u.*.chunk" >/dev/null 2>&1; then
+      ls -1 "$workdir"/u.*.chunk 2>/dev/null \
+       | xargs -n1 -P "$workers" bash -c 'process_uaa_scim_chunk_or "$1" "$2" "$3" "$4"' _ {} "$workdir" "$uaa" "$token"
+    fi
 
-      filter=""
-      while IFS= read -r u; do
-        [[ -z "$u" ]] && continue
-        u="${u,,}"
-        u="${u//\"/\\\"}"
-        [[ -n "$filter" ]] && filter+=" or "
-        filter+="userName eq \"${u}\""
-      done <"$chunk"
+    # Merge parts → out_map
+    if compgen -G "$workdir/part.*.json" >/dev/null 2>&1; then
+      jq -s 'reduce .[] as $o ({}; . * $o)' "$workdir"/part.*.json >"$out_map" 2>/dev/null || echo "{}" >"$out_map"
+    else
+      echo "{}" >"$out_map"
+    fi
 
-      enc=$(printf "%s" "$filter" | jq -sRr @uri)
-
-      resp=$(curl -sS -k \
-        -H "Authorization: ${token}" \
-        -H "Accept: application/json" \
-        "${uaa}/Users?filter=${enc}&startIndex=1&count=1000" 2>/dev/null || echo "{}")
-
-      jq -c -f /dev/fd/3 <<<"$resp" >"$workdir/part.$(basename "$chunk").json" 3<<'"'"'JQ'"'"'
-reduce (.resources // [])[] as $r ({}; 
-  .[($r.userName // "" | ascii_downcase)] =
-    ((($r.emails[0].value // $r.emails[0] // "") | tostring))
-)
-JQ
-    ' _ {} "$workdir" "$uaa" "$token"
+  else
+    # Fallback: parallel per-user SCIM lookups (still deduped)
+    cat "$users_norm" \
+    | xargs -n1 -P "$workers" bash -c 'process_uaa_scim_user_single "$1" "$2" "$3" "$4"' _ {} "$workdir" "$uaa" "$token"
 
     if compgen -G "$workdir/part.*.json" >/dev/null 2>&1; then
       jq -s 'reduce .[] as $o ({}; . * $o)' "$workdir"/part.*.json >"$out_map" 2>/dev/null || echo "{}" >"$out_map"
     else
       echo "{}" >"$out_map"
     fi
-  else
-    # Fallback: parallel per-user SCIM lookups (still deduped)
-    cat "$users_file" \
-      | xargs -n1 -P "$workers" bash -c '
-          set -euo pipefail
-          u="$1"; workdir="$2"; uaa="$3"; token="$4"
-          u="${u,,}"
-
-          if [[ "$u" == *"@"* ]]; then
-            jq -n --arg u "$u" --arg e "$u" "{($u):$e}" >"$workdir/part.$$.json"
-            exit 0
-          fi
-
-          f=$(printf "userName eq \"%s\"" "$u" | jq -sRr @uri)
-          resp=$(curl -sS -k -H "Authorization: ${token}" -H "Accept: application/json" \
-            "${uaa}/Users?filter=${f}&startIndex=1&count=1" 2>/dev/null || echo "{}")
-          e=$(jq -r "try (.resources[0].emails[0].value // .resources[0].emails[0] // \"\") catch \"\"" <<<"$resp")
-          jq -n --arg u "$u" --arg e "$e" "{($u):$e}" >"$workdir/part.$$.json"
-        ' _ {} "$workdir" "$uaa" "$token"
-
-    jq -s 'reduce .[] as $o ({}; . * $o)' "$workdir"/part.*.json >"$out_map" 2>/dev/null || echo "{}" >"$out_map"
   fi
 
   rm -rf "$workdir"
@@ -777,12 +822,11 @@ write_role_membership_data_v3_fast() {
 
   # Emit lines with: stable_key, foundation_slug, org_name, space_name, env..., scope, role, username, batch
   # Then we bulk enrich username -> email.
-  jq -rc '.[]' <<<"$roles_json" | while IFS= read -r r; do
+  while IFS= read -r r; do
     local type user_guid username scope org_guid space_guid org_name space_name stable_key role_norm
 
     type="$(jq -r '.type // ""' <<<"$r")"
     user_guid="$(jq -r '.relationships.user.data.guid // ""' <<<"$r")"
-    username="$(jq -r --arg ug "$user_guid" 'try $m[$ug] catch ""' --argjson m "$user_map" <<<"{}" 2>/dev/null || true)"
     # jq trick above is messy in bash; do it cleanly using jq against user_map:
     username="$(jq -r --arg ug "$user_guid" '.[$ug] // ""' <<<"$user_map" 2>/dev/null || true)"
     username="${username,,}"
@@ -837,9 +881,9 @@ write_role_membership_data_v3_fast() {
     fi
     SEEN_ROW["$dk"]=1
 
-    printf '%s\n' "$username" >>"$tmp_users"
+    [[ -n "$username" ]] && printf '%s\n' "$username" >>"$tmp_users"
     printf '%s\n' "${stable_key}${US}${FOUNDATION_SLUG}${US}${org_name}${US}${space_name}${US}${ENV_LOCATION}${US}${ENV_TYPE}${US}${ENV_DATACENTER}${US}${scope}${US}${role_norm}${US}${username}${US}${BATCH_ID}" >>"$tmp_rows"
-  done
+  done < <(jq -rc '.[]' <<<"$roles_json")
 
   # If nothing to write, stop
   if [[ ! -s "$tmp_rows" ]]; then
@@ -867,6 +911,7 @@ write_role_membership_data_v3_fast() {
     if [[ "$user" == *"@"* ]]; then
       email="$user"
     else
+      user="${user,,}"
       email="$(jq -r --arg u "$user" '.[$u] // ""' "$email_map" 2>/dev/null || true)"
     fi
 
