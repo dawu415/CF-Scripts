@@ -658,37 +658,34 @@ build_uaa_email_map_fast() {
   if [[ "$supports_or" == "1" ]]; then
     split -l "$chunk_size" -d -a 4 --additional-suffix=.chunk "$users_file" "$workdir/u."
 
-    ls -1 "$workdir"/u.*.chunk 2>/dev/null \
-      | xargs -n1 -P "$workers" bash -c '
-          set -euo pipefail
-          chunk="$1"; workdir="$2"; uaa="$3"; token="$4"
+ls -1 "$workdir"/u.*.chunk 2>/dev/null \
+  | xargs -n1 -P "$workers" bash -c '
+      set -euo pipefail
+      chunk="$1"; workdir="$2"; uaa="$3"; token="$4"
 
-          filter=""
-          while IFS= read -r u; do
-            [[ -z "$u" ]] && continue
-            u="${u,,}"
-            # If username already email, we can keep it without UAA lookup later,
-            # but leaving it in the filter is harmless. We keep it simple.
-            u="${u//\"/\\\"}"
-            [[ -n "$filter" ]] && filter+=" or "
-            filter+="userName eq \"${u}\""
-          done <"$chunk"
+      filter=""
+      while IFS= read -r u; do
+        [[ -z "$u" ]] && continue
+        u="${u,,}"
+        u="${u//\"/\\\"}"
+        [[ -n "$filter" ]] && filter+=" or "
+        filter+="userName eq \"${u}\""
+      done <"$chunk"
 
-          enc=$(printf "%s" "$filter" | jq -sRr @uri)
+      enc=$(printf "%s" "$filter" | jq -sRr @uri)
 
-          resp=$(curl -sS -k \
-            -H "Authorization: ${token}" \
-            -H "Accept: application/json" \
-            "${uaa}/Users?filter=${enc}&startIndex=1&count=1000" 2>/dev/null || echo "{}")
+      resp=$(curl -sS -k \
+        -H "Authorization: ${token}" \
+        -H "Accept: application/json" \
+        "${uaa}/Users?filter=${enc}&startIndex=1&count=1000" 2>/dev/null || echo "{}")
 
-          jq -c '
-            reduce (.resources // [])[] as $r ({}; 
-              .[($r.userName // "" | ascii_downcase)] = (
-                ($r.emails[0].value // $r.emails[0] // "") | tostring
-              )
-            )
-          ' <<<"$resp" >"$workdir/part.$(basename "$chunk").json"
-        ' _ {} "$workdir" "$uaa" "$token"
+      jq -c -f /dev/fd/3 <<<"$resp" >"$workdir/part.$(basename "$chunk").json" 3<<'"'"'JQ'"'"'
+reduce (.resources // [])[] as $r ({}; 
+  .[($r.userName // "" | ascii_downcase)] =
+    ((($r.emails[0].value // $r.emails[0] // "") | tostring))
+)
+JQ
+    ' _ {} "$workdir" "$uaa" "$token"
 
     if compgen -G "$workdir/part.*.json" >/dev/null 2>&1; then
       jq -s 'reduce .[] as $o ({}; . * $o)' "$workdir"/part.*.json >"$out_map" 2>/dev/null || echo "{}" >"$out_map"
