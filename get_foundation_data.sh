@@ -738,7 +738,7 @@ build_uaa_email_map_fast() {
     # Process each chunk in parallel using exported function
     if compgen -G "$workdir/u.*.chunk" >/dev/null 2>&1; then
       ls -1 "$workdir"/u.*.chunk 2>/dev/null \
-        | xargs -r -n1 -P "$workers" bash -c 'process_uaa_scim_chunk_or "$1" "$2" "$3" "$4"' _ "$workdir" "$uaa" "$token"
+        | xargs -r -I{} -P "$workers" bash -c 'process_uaa_scim_chunk_or "$1" "$2" "$3" "$4"' _ "{}" "$workdir" "$uaa" "$token"
     fi
 
     # Merge parts → out_map
@@ -751,8 +751,7 @@ build_uaa_email_map_fast() {
   else
     # Fallback: parallel per-user SCIM lookups (still deduped)
     cat "$users_norm" \
-      | xargs -r -n1 -P "$workers" bash -c 'process_uaa_scim_user_single "$1" "$2" "$3" "$4"' _ "$workdir" "$uaa" "$token"
-
+      | xargs -r -I{} -P "$workers" bash -c 'process_uaa_scim_user_single "$1" "$2" "$3" "$4"' _ "{}" "$workdir" "$uaa" "$token"
 
     if compgen -G "$workdir/part.*.json" >/dev/null 2>&1; then
       ls -1 "$workdir"/part.*.json 2>/dev/null \
