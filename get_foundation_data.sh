@@ -106,6 +106,10 @@ ENV_DATACENTER="${ENV_DATACENTER:-unknown}"
 # Preferred foundation slug (used in Stable_Key, CSVs, etc.)
 FOUNDATION_SLUG="${CF_ORCH_PLATFORM:-${FOUNDATION_SLUG:-$FOUNDATION_KEY}}"
 
+export V3_USER_CHUNK_SIZE=120     # /v3/users guids per call
+export UAA_SCIM_CHUNK_SIZE=50     # usernames per OR query
+export UAA_SCIM_WORKERS=6         # parallel SCIM calls
+
 ###############################################################################
 # Audit Event Filtering Configuration
 ###############################################################################
@@ -552,6 +556,335 @@ fetch_all_pages_v3() {
 }
 
 ###############################################################################
+# v3 helper: fetch resources by GUID list in chunks
+###############################################################################
+fetch_v3_with_param_chunks() {
+  local base="$1" param="$2" chunk_size="$3"
+  shift 3
+  local -a items=( "$@" )
+
+  if ! [[ "$chunk_size" =~ ^[1-9][0-9]*$ ]]; then
+    chunk_size=50
+  fi
+
+  {
+    local -a chunk=()
+    local g
+    for g in "${items[@]}"; do
+      [[ -z "$g" || "$g" == "null" ]] && continue
+      chunk+=( "$g" )
+      if ((${#chunk[@]} >= chunk_size)); then
+        local q; printf -v q '%s,' "${chunk[@]}"; q="${q%,}"
+        fetch_all_pages_v3 "${base}?${param}=${q}" | jq -rc '.[]' 2>/dev/null || true
+        chunk=()
+      fi
+    done
+
+    if ((${#chunk[@]})); then
+      local q; printf -v q '%s,' "${chunk[@]}"; q="${q%,}"
+      fetch_all_pages_v3 "${base}?${param}=${q}" | jq -rc '.[]' 2>/dev/null || true
+    fi
+  } | jq -s '[.[]]'
+}
+
+export -f fetch_v3_with_param_chunks
+
+###############################################################################
+# FAST UAA email resolution (bulk SCIM OR filters + parallel chunking)
+###############################################################################
+
+derive_uaa_from_cf_api() {
+  local api="${CF_API:-}"
+  [[ -z "$api" ]] && { echo ""; return; }
+
+  api="${api#http://}"
+  api="${api#https://}"
+  api="${api%%/*}"
+
+  # api.<sysdomain> -> uaa.<sysdomain>
+  if [[ "$api" == api.* ]]; then
+    echo "https://${api/api./uaa.}"
+  else
+    echo "https://uaa.${api}"
+  fi
+}
+
+get_cf_oauth_token() {
+  # returns "bearer <token>" already
+  cf oauth-token 2>/dev/null | tr -d '\r' | awk 'NF{print; exit}'
+}
+
+scim_supports_or_filter() {
+  local uaa="$1" token="$2"
+  [[ -z "$uaa" || -z "$token" ]] && return 1
+
+  local f
+  f="$(printf 'userName eq "%s" or userName eq "%s"' "__no_such_user_1__" "__no_such_user_2__" | jq -sRr @uri)"
+  local code
+  code="$(curl -sS -k -o /dev/null -w '%{http_code}' \
+    -H "Authorization: ${token}" -H "Accept: application/json" \
+    "${uaa}/Users?filter=${f}&startIndex=1&count=2" 2>/dev/null || true)"
+
+  [[ "$code" == "200" ]]
+}
+
+# Build JSON map: { "username": "email", ... }
+build_uaa_email_map_fast() {
+  local users_file="$1"
+  local out_map="$2"
+
+  local uaa="${UAA_BASE_URL:-}"
+  local token="${CF_OAUTH_TOKEN:-}"
+
+  if [[ -z "$uaa" || -z "$token" ]]; then
+    echo "{}" >"$out_map"
+    return 0
+  fi
+
+  local chunk_size="${UAA_SCIM_CHUNK_SIZE:-35}"
+  local workers="${UAA_SCIM_WORKERS:-6}"
+
+  if ! [[ "$chunk_size" =~ ^[1-9][0-9]*$ ]]; then chunk_size=35; fi
+  if ! [[ "$workers" =~ ^[1-9][0-9]*$ ]]; then workers=6; fi
+
+  local supports_or=0
+  if scim_supports_or_filter "$uaa" "$token"; then
+    supports_or=1
+  fi
+
+  local workdir
+  workdir="$(mktemp -d "${WORK_DIR%/}/uaa_email_parts.XXXXXX")"
+
+  if [[ "$supports_or" == "1" ]]; then
+    split -l "$chunk_size" -d -a 4 --additional-suffix=.chunk "$users_file" "$workdir/u."
+
+    ls -1 "$workdir"/u.*.chunk 2>/dev/null \
+      | xargs -n1 -P "$workers" bash -c '
+          set -euo pipefail
+          chunk="$1"; workdir="$2"; uaa="$3"; token="$4"
+
+          filter=""
+          while IFS= read -r u; do
+            [[ -z "$u" ]] && continue
+            u="${u,,}"
+            # If username already email, we can keep it without UAA lookup later,
+            # but leaving it in the filter is harmless. We keep it simple.
+            u="${u//\"/\\\"}"
+            [[ -n "$filter" ]] && filter+=" or "
+            filter+="userName eq \"${u}\""
+          done <"$chunk"
+
+          enc=$(printf "%s" "$filter" | jq -sRr @uri)
+
+          resp=$(curl -sS -k \
+            -H "Authorization: ${token}" \
+            -H "Accept: application/json" \
+            "${uaa}/Users?filter=${enc}&startIndex=1&count=1000" 2>/dev/null || echo "{}")
+
+          jq -c '
+            reduce (.resources // [])[] as $r ({}; 
+              .[($r.userName // "" | ascii_downcase)] = (
+                ($r.emails[0].value // $r.emails[0] // "") | tostring
+              )
+            )
+          ' <<<"$resp" >"$workdir/part.$(basename "$chunk").json"
+        ' _ {} "$workdir" "$uaa" "$token"
+
+    if compgen -G "$workdir/part.*.json" >/dev/null 2>&1; then
+      jq -s 'reduce .[] as $o ({}; . * $o)' "$workdir"/part.*.json >"$out_map" 2>/dev/null || echo "{}" >"$out_map"
+    else
+      echo "{}" >"$out_map"
+    fi
+  else
+    # Fallback: parallel per-user SCIM lookups (still deduped)
+    cat "$users_file" \
+      | xargs -n1 -P "$workers" bash -c '
+          set -euo pipefail
+          u="$1"; workdir="$2"; uaa="$3"; token="$4"
+          u="${u,,}"
+
+          if [[ "$u" == *"@"* ]]; then
+            jq -n --arg u "$u" --arg e "$u" "{($u):$e}" >"$workdir/part.$$.json"
+            exit 0
+          fi
+
+          f=$(printf "userName eq \"%s\"" "$u" | jq -sRr @uri)
+          resp=$(curl -sS -k -H "Authorization: ${token}" -H "Accept: application/json" \
+            "${uaa}/Users?filter=${f}&startIndex=1&count=1" 2>/dev/null || echo "{}")
+          e=$(jq -r "try (.resources[0].emails[0].value // .resources[0].emails[0] // \"\") catch \"\"" <<<"$resp")
+          jq -n --arg u "$u" --arg e "$e" "{($u):$e}" >"$workdir/part.$$.json"
+        ' _ {} "$workdir" "$uaa" "$token"
+
+    jq -s 'reduce .[] as $o ({}; . * $o)' "$workdir"/part.*.json >"$out_map" 2>/dev/null || echo "{}" >"$out_map"
+  fi
+
+  rm -rf "$workdir"
+}
+
+export -f derive_uaa_from_cf_api get_cf_oauth_token scim_supports_or_filter build_uaa_email_map_fast
+
+###############################################################################
+# FAST role membership using /v3/roles (+ /v3/users join) + bulk UAA email map
+###############################################################################
+
+write_role_membership_data_v3_fast() {
+  [[ -z "${ROLE_MEMBERSHIP_OUT:-}" ]] && return 0
+
+  echo "Building role_membership_data via /v3/roles (FAST)..." >&2
+
+  # Only the role types you care about:
+  local types="space_developer,space_manager,space_auditor,organization_manager,organization_billing_manager,organization_auditor"
+
+  # 1) Pull roles (paginated)
+  local roles_json
+  roles_json="$(fetch_all_pages_v3 "/v3/roles?types=${types}")"
+  if [[ -z "$roles_json" || "$roles_json" == "null" || "$(jq 'length' <<<"$roles_json")" -eq 0 ]]; then
+    echo "No roles returned from /v3/roles on foundation ${FOUNDATION_SLUG}; skipping." >&2
+    return 0
+  fi
+
+  # 2) Extract unique user guids from roles
+  mapfile -t USER_GUIDS < <(
+    jq -r '.[].relationships.user.data.guid // empty' <<<"$roles_json" | sort -u
+  )
+
+  # 3) Fetch /v3/users in chunks to get username
+  local users_json='[]'
+  if ((${#USER_GUIDS[@]})); then
+    local user_chunk="${V3_USER_CHUNK_SIZE:-80}"
+    if ! [[ "$user_chunk" =~ ^[1-9][0-9]*$ ]]; then user_chunk=80; fi
+    users_json="$(fetch_v3_with_param_chunks "/v3/users" "guids" "$user_chunk" "${USER_GUIDS[@]}")"
+  fi
+
+  # Build user_guid -> username map
+  local user_map
+  user_map="$(jq -c 'map({key:.guid, value:(.username // "")}) | from_entries' <<<"$users_json" 2>/dev/null || echo '{}')"
+
+  # 4) Prepare org/space lookup maps from your existing v2 caches (FAST, no calls)
+  local org_name_map space_name_map space_org_map
+  org_name_map="$(jq -c '(.resources // []) | map({key:.metadata.guid, value:(.entity.name // "")}) | from_entries' "$ORGS_JSON_FILE" 2>/dev/null || echo '{}')"
+  space_name_map="$(jq -c '(.resources // []) | map({key:.metadata.guid, value:(.entity.name // "")}) | from_entries' "$SPACES_JSON_FILE" 2>/dev/null || echo '{}')"
+  space_org_map="$(jq -c '(.resources // []) | map({key:.metadata.guid, value:(.entity.organization_guid // "")}) | from_entries' "$SPACES_JSON_FILE" 2>/dev/null || echo '{}')"
+
+  # 5) Pass 1: build row stubs + username list
+  local US=$'\x1F'
+  local tmp_rows="$WORK_DIR/role_rows.usv"
+  local tmp_users="$WORK_DIR/role_users.txt"
+  local email_map="$WORK_DIR/uaa_email_map.json"
+
+  : >"$tmp_rows"
+  : >"$tmp_users"
+
+  # Dedup role rows: roles can overlap and /v3/roles might include duplicates in odd cases
+  declare -A SEEN_ROW
+
+  # Emit lines with: stable_key, foundation_slug, org_name, space_name, env..., scope, role, username, batch
+  # Then we bulk enrich username -> email.
+  jq -rc '.[]' <<<"$roles_json" | while IFS= read -r r; do
+    local type user_guid username scope org_guid space_guid org_name space_name stable_key role_norm
+
+    type="$(jq -r '.type // ""' <<<"$r")"
+    user_guid="$(jq -r '.relationships.user.data.guid // ""' <<<"$r")"
+    username="$(jq -r --arg ug "$user_guid" 'try $m[$ug] catch ""' --argjson m "$user_map" <<<"{}" 2>/dev/null || true)"
+    # jq trick above is messy in bash; do it cleanly using jq against user_map:
+    username="$(jq -r --arg ug "$user_guid" '.[$ug] // ""' <<<"$user_map" 2>/dev/null || true)"
+    username="${username,,}"
+
+    # Determine scope + target GUIDs
+    case "$type" in
+      space_developer|space_manager|space_auditor|space_supporter)
+        scope="space"
+        space_guid="$(jq -r '.relationships.space.data.guid // ""' <<<"$r")"
+        org_guid="$(jq -r --arg sg "$space_guid" '.[$sg] // ""' <<<"$space_org_map" 2>/dev/null || true)"
+        ;;
+      organization_manager|organization_billing_manager|organization_auditor|organization_user)
+        scope="org"
+        org_guid="$(jq -r '.relationships.organization.data.guid // ""' <<<"$r")"
+        space_guid=""
+        ;;
+      *)
+        # ignore role types you didn't ask for
+        continue
+        ;;
+    esac
+
+    [[ -z "$org_guid" && -z "$space_guid" ]] && continue
+    [[ -z "$username" ]] && continue
+
+    org_name="$(jq -r --arg og "$org_guid" '.[$og] // ""' <<<"$org_name_map" 2>/dev/null || true)"
+    space_name=""
+    if [[ -n "$space_guid" ]]; then
+      space_name="$(jq -r --arg sg "$space_guid" '.[$sg] // ""' <<<"$space_name_map" 2>/dev/null || true)"
+    fi
+
+    # Stable key convention: same as you use elsewhere
+    stable_key="${FOUNDATION_SLUG}:${org_name}:${space_name}"
+
+    # Normalize role label to match your earlier naming
+    case "$type" in
+      space_developer) role_norm="SPACE_DEVELOPER" ;;
+      space_manager) role_norm="SPACE_MANAGER" ;;
+      space_auditor) role_norm="SPACE_AUDITOR" ;;
+      space_supporter) role_norm="SPACE_SUPPORTER" ;;
+      organization_manager) role_norm="ORG_MANAGER" ;;
+      organization_billing_manager) role_norm="BILLING_MANAGER" ;;
+      organization_auditor) role_norm="ORG_AUDITOR" ;;
+      organization_user) role_norm="ORG_USER" ;;
+      *) role_norm="$type" ;;
+    esac
+
+    # Dedup key
+    local dk="${stable_key}|${scope}|${role_norm}|${username}|${BATCH_ID}"
+    if [[ -n "${SEEN_ROW[$dk]:-}" ]]; then
+      continue
+    fi
+    SEEN_ROW["$dk"]=1
+
+    printf '%s\n' "$username" >>"$tmp_users"
+    printf '%s\n' "${stable_key}${US}${FOUNDATION_SLUG}${US}${org_name}${US}${space_name}${US}${ENV_LOCATION}${US}${ENV_TYPE}${US}${ENV_DATACENTER}${US}${scope}${US}${role_norm}${US}${username}${US}${BATCH_ID}" >>"$tmp_rows"
+  done
+
+  # If nothing to write, stop
+  if [[ ! -s "$tmp_rows" ]]; then
+    echo "No role rows produced after filtering/join; skipping." >&2
+    return 0
+  fi
+
+  # 6) Bulk resolve emails (fast)
+  sort -u "$tmp_users" -o "$tmp_users"
+
+  UAA_BASE_URL="$(derive_uaa_from_cf_api)"
+  CF_OAUTH_TOKEN="$(get_cf_oauth_token)"
+  export UAA_BASE_URL CF_OAUTH_TOKEN
+
+  if [[ -n "$UAA_BASE_URL" && -n "$CF_OAUTH_TOKEN" ]]; then
+    build_uaa_email_map_fast "$tmp_users" "$email_map"
+  else
+    echo "{}" >"$email_map"
+    echo "WARNING: No UAA_BASE_URL or CF_OAUTH_TOKEN; Email column will be blank." >&2
+  fi
+
+  # 7) Write CSV (no network calls here)
+  while IFS=$'\x1F' read -r stable_key foundation_slug org_name space_name env_loc env_type env_dc scope role user batch; do
+    local email=""
+    if [[ "$user" == *"@"* ]]; then
+      email="$user"
+    else
+      email="$(jq -r --arg u "$user" '.[$u] // ""' "$email_map" 2>/dev/null || true)"
+    fi
+
+    csv_write_row "$ROLE_MEMBERSHIP_OUT" \
+      "$stable_key" "$foundation_slug" "$org_name" "$space_name" \
+      "$env_loc" "$env_type" "$env_dc" \
+      "$scope" "$role" "$user" "$email" "$batch"
+  done <"$tmp_rows"
+
+  echo "role_membership_data complete: $ROLE_MEMBERSHIP_OUT" >&2
+}
+
+export -f write_role_membership_data_v3_fast
+
+###############################################################################
 # Cache Setup (buildpacks / spaces / orgs / stacks + WORK_DIR)
 ###############################################################################
 
@@ -782,6 +1115,7 @@ init_output_paths_and_headers() {
     JAVA_RUNTIME_OUT="$OUTPUT_DIR/java_runtime_data.csv"
     AUDIT_EVENTS_OUT="$OUTPUT_DIR/audit_events.csv"
     SERVICE_BINDINGS_OUT="$OUTPUT_DIR/service_bindings.csv"
+    ROLE_MEMBERSHIP_OUT="$OUTPUT_DIR/role_membership_data.csv"
   else
     APP_DATA_OUT="${BASE_OUTPUT%.csv}.csv"
     SERVICE_DATA_OUT=""
@@ -789,6 +1123,7 @@ init_output_paths_and_headers() {
     JAVA_RUNTIME_OUT=""
     AUDIT_EVENTS_OUT=""
     SERVICE_BINDINGS_OUT=""
+    ROLE_MEMBERSHIP_OUT=""
   fi
 
   echo "Initializing output files..." >&2
@@ -836,6 +1171,12 @@ init_output_paths_and_headers() {
     "Foundation_Slug" "Batch_Id"
   )
 
+  local ROLE_HEADER=(
+    "Stable_Key" "Foundation_Slug" "Org_Name" "Space_Name"
+    "Env_Location" "Env_Type" "Env_Datacenter"
+    "Scope" "Role" "Username" "Email" "Batch_Id"
+  )
+
   # Total binding columns in the CSV (including Foundation_Slug + Batch_Id).
   BINDINGS_COL_COUNT=${#BINDINGS_HEADER[@]}
   # Columns produced by jq (@tsv) *before* we append Foundation_Slug + Batch_Id.
@@ -848,6 +1189,8 @@ init_output_paths_and_headers() {
   [[ -n "$JAVA_RUNTIME_OUT"     ]] && csv_write_header "$JAVA_RUNTIME_OUT"     "${JAVA_HEADER[@]}"
   [[ -n "$AUDIT_EVENTS_OUT"     ]] && csv_write_header "$AUDIT_EVENTS_OUT"     "${EVENTS_HEADER[@]}"
   [[ -n "$SERVICE_BINDINGS_OUT" ]] && csv_write_header "$SERVICE_BINDINGS_OUT" "${BINDINGS_HEADER[@]}"
+  [[ -n "$ROLE_MEMBERSHIP_OUT"  ]] && csv_write_header "$ROLE_MEMBERSHIP_OUT"  "${ROLE_HEADER[@]}"
+
 }
 
 ###############################################################################
@@ -1730,14 +2073,16 @@ main() {
   # Ensure these variables are exported so subshells (&, xargs) see them
   export FOUNDATION_SLUG ENV_LOCATION ENV_TYPE ENV_DATACENTER BATCH_ID \
          APP_DATA_OUT SERVICE_DATA_OUT DEVELOPER_DATA_OUT JAVA_RUNTIME_OUT \
-         AUDIT_EVENTS_OUT SERVICE_BINDINGS_OUT SPACE_DEVS_JSON_FILE WORK_DIR CACHE_ROOT ORCH_OUT_DIR
+         AUDIT_EVENTS_OUT SERVICE_BINDINGS_OUT ROLE_MEMBERSHIP_OUT SPACE_DEVS_JSON_FILE WORK_DIR CACHE_ROOT ORCH_OUT_DIR
 
   export -f process_app fetch_all_pages_v2 fetch_all_pages_v3 \
             get_buildpack_filename get_version_info get_stack_name_safe \
             get_space_org_names_safe simplify_buildpack_name extract_full_version \
             csv_write_row csv_row csv_cell get_jre_version build_space_dev_cache \
             process_app_wrapper write_developer_space_data run_app_phase \
-            run_developer_space_phase run_service_bindings_phase
+            run_developer_space_phase run_service_bindings_phase \
+            write_role_membership_data_v3_fast fetch_v3_with_param_chunks \
+            derive_uaa_from_cf_api get_cf_oauth_token scim_supports_or_filter build_uaa_email_map_fast
 
   # 3) Snapshot /v2/apps once to a local file for all phases
   APPS_JSON_FILE="$WORK_DIR/apps.json"
@@ -1766,10 +2111,14 @@ main() {
   run_service_bindings_phase &
   local pid_bind=$!
 
+  write_role_membership_data_v3_fast &
+  local pid_roles=$!
+
   # Wait for all phases to complete
   wait "$pid_apps"  2>/dev/null || true
   wait "$pid_devs"  2>/dev/null || true
   wait "$pid_bind"  2>/dev/null || true
+  wait "$pid_roles" 2>/dev/null || true
 
   echo "Data collection complete." >&2
   echo "Output:" >&2
@@ -1779,6 +2128,8 @@ main() {
   [[ -n "$JAVA_RUNTIME_OUT"     ]] && echo "  java_runtime_data:    $JAVA_RUNTIME_OUT" >&2
   [[ -n "$AUDIT_EVENTS_OUT"     ]] && echo "  audit_events:         $AUDIT_EVENTS_OUT" >&2
   [[ -n "$SERVICE_BINDINGS_OUT" ]] && echo "  service_bindings:     $SERVICE_BINDINGS_OUT" >&2
+  [[ -n "$ROLE_MEMBERSHIP_OUT"  ]] && echo "  role_membership_data: $ROLE_MEMBERSHIP_OUT" >&2
+
 }
 
 main "$@"
