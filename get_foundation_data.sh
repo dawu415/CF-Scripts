@@ -738,7 +738,7 @@ build_uaa_email_map_fast() {
     # Process each chunk in parallel using exported function
     if compgen -G "$workdir/u.*.chunk" >/dev/null 2>&1; then
       ls -1 "$workdir"/u.*.chunk 2>/dev/null \
-       | xargs -n1 -P "$workers" bash -c 'process_uaa_scim_chunk_or "$1" "$2" "$3" "$4"' _ {} "$workdir" "$uaa" "$token"
+        | xargs -r -n1 -P "$workers" bash -c 'process_uaa_scim_chunk_or "$1" "$2" "$3" "$4"' _ "$workdir" "$uaa" "$token"
     fi
 
     # Merge parts → out_map
@@ -751,10 +751,13 @@ build_uaa_email_map_fast() {
   else
     # Fallback: parallel per-user SCIM lookups (still deduped)
     cat "$users_norm" \
-    | xargs -n1 -P "$workers" bash -c 'process_uaa_scim_user_single "$1" "$2" "$3" "$4"' _ {} "$workdir" "$uaa" "$token"
+      | xargs -r -n1 -P "$workers" bash -c 'process_uaa_scim_user_single "$1" "$2" "$3" "$4"' _ "$workdir" "$uaa" "$token"
+
 
     if compgen -G "$workdir/part.*.json" >/dev/null 2>&1; then
-      jq -s 'reduce .[] as $o ({}; . * $o)' "$workdir"/part.*.json >"$out_map" 2>/dev/null || echo "{}" >"$out_map"
+      ls -1 "$workdir"/part.*.json 2>/dev/null \
+          | jq -s 'reduce .[] as $o ({}; . * $o)' >"$out_map" 2>/dev/null || echo "{}" >"$out_map"
+
     else
       echo "{}" >"$out_map"
     fi
@@ -2291,6 +2294,21 @@ main() {
 
   # 5) Build the space → developers cache (now consumes cached v3 roles)
   build_space_dev_cache
+
+  # =============================
+  # TEMP: ROLE-ONLY DRY RUN
+  # =============================
+  if [[ "${ROLE_ONLY_TEST:-0}" == "1" ]]; then
+    echo "ROLE_ONLY_TEST enabled – skipping app/service phases" >&2
+
+    write_role_membership_data_v3_fast
+
+    echo "ROLE_ONLY_TEST complete." >&2
+    echo "Outputs:" >&2
+    echo "  space_devs:           $SPACE_DEVS_JSON_FILE" >&2
+    echo "  role_membership_data: $ROLE_MEMBERSHIP_OUT" >&2
+    exit 0
+  fi
 
   # 6) Run the three heavy phases in parallel:
   #    - app inventory / audit events
