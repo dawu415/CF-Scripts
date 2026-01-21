@@ -661,8 +661,11 @@ process_uaa_scim_chunk_or() {
   # Emit partial map: keys lowercased
   jq -c '
     reduce (.resources // [])[] as $r ({}; 
-      .[($r.userName // "" | ascii_downcase)] =
-        ((($r.emails[0].value // $r.emails[0] // "") | tostring))
+      .[($r.userName // "" | ascii_downcase)] = {
+        email: ((($r.emails[0].value // $r.emails[0] // "") | tostring)),
+        first_name: ((($r.name.givenName // "") | tostring)),
+        last_name: ((($r.name.familyName // "") | tostring))
+      }
     )
   ' <<<"$resp" >"$workdir/part.$(basename "$chunk").json"
 }
@@ -679,7 +682,8 @@ process_uaa_scim_user_single() {
 
   # If username already looks like email, map to itself (lowercase)
   if [[ "$user" == *"@"* ]]; then
-    jq -n --arg u "$user" --arg e "$user" '{($u):$e}' >"$workdir/part.$$.json"
+    jq -n --arg u "$user" --arg e "$user" --arg f "" --arg l "" \
+      '{($u): {email:$e, first_name:$f, last_name:$l}}' >"$workdir/part.$$.json"
     exit 0
   fi
 
@@ -696,7 +700,14 @@ process_uaa_scim_user_single() {
   email="$(jq -r 'try (.resources[0].emails[0].value // .resources[0].emails[0] // "") catch ""' <<<"$resp" 2>/dev/null || true)"
   email="${email,,}"
 
-  jq -n --arg u "$user" --arg e "$email" '{($u):$e}' >"$workdir/part.$$.json"
+  local first last
+  first="$(jq -r 'try (.resources[0].name.givenName // "") catch ""' <<<"$resp" 2>/dev/null || true)"
+  last="$(jq -r 'try (.resources[0].name.familyName // "") catch ""' <<<"$resp" 2>/dev/null || true)"
+  first="${first}"
+  last="${last}"
+
+  jq -n --arg u "$user" --arg e "$email" --arg f "$first" --arg l "$last" \
+    '{($u): {email:$e, first_name:$f, last_name:$l}}' >"$workdir/part.$$.json"
 }
 
 export -f process_uaa_scim_chunk_or process_uaa_scim_user_single
@@ -903,7 +914,7 @@ write_role_membership_data_v3_fast() {
     SEEN_ROW["$dk"]=1
 
     printf '%s\n' "$username" >>"$tmp_users"
-    printf '%s\n' "${stable_key}${US}${FOUNDATION_SLUG}${US}${org_name}${US}${space_name}${US}${ENV_LOCATION}${US}${ENV_TYPE}${US}${ENV_DATACENTER}${US}${scope}${US}${role_norm}${US}${username}${US}${BATCH_ID}" >>"$tmp_rows"
+    printf '%s\n' "${stable_key}${US}${FOUNDATION_SLUG}${US}${org_name}${US}${org_guid}${US}${space_name}${US}${space_guid}${US}${ENV_LOCATION}${US}${ENV_TYPE}${US}${ENV_DATACENTER}${US}${scope}${US}${role_norm}${US}${username}${US}${BATCH_ID}" >>"$tmp_rows"
   done < <(jq -rc '.[]' <<<"$roles_json")
 
   [[ ! -s "$tmp_rows" ]] && { echo "No role rows produced; skipping." >&2; return 0; }
@@ -923,19 +934,26 @@ write_role_membership_data_v3_fast() {
   fi
 
   # Write CSV
-  while IFS=$'\x1F' read -r stable_key foundation_slug org_name space_name env_loc env_type env_dc scope role user batch; do
-    local email=""
+  while IFS=$'\x1F' read -r stable_key foundation_slug org_name org_guid space_name space_guid env_loc env_type env_dc scope role user batch; do
+    local email="" first_name="" last_name=""
+
     if [[ "$user" == *"@"* ]]; then
       email="$user"
     else
       user="${user,,}"
-      email="$(jq -r --arg u "$user" '.[$u] // ""' "$email_map" 2>/dev/null || true)"
+      email="$(jq -r --arg u "$user" '.[$u].email // ""' "$email_map" 2>/dev/null || true)"
+      first_name="$(jq -r --arg u "$user" '.[$u].first_name // ""' "$email_map" 2>/dev/null || true)"
+      last_name="$(jq -r --arg u "$user" '.[$u].last_name // ""' "$email_map" 2>/dev/null || true)"
     fi
 
     csv_write_row "$ROLE_MEMBERSHIP_OUT" \
-      "$stable_key" "$foundation_slug" "$org_name" "$space_name" \
+      "$stable_key" "$foundation_slug" \
+      "$org_name" "$org_guid" \
+      "$space_name" "$space_guid" \
       "$env_loc" "$env_type" "$env_dc" \
-      "$scope" "$role" "$user" "$email" "$batch"
+      "$scope" "$role" \
+      "$user" "$email" "$first_name" "$last_name" \
+      "$batch"
   done <"$tmp_rows"
 
   echo "role_membership_data complete: $ROLE_MEMBERSHIP_OUT" >&2
@@ -1364,9 +1382,13 @@ init_output_paths_and_headers() {
   )
 
   local ROLE_HEADER=(
-    "Stable_Key" "Foundation_Slug" "Org_Name" "Space_Name"
+    "Stable_Key" "Foundation_Slug"
+    "Org_Name" "Org_GUID"
+    "Space_Name" "Space_GUID"
     "Env_Location" "Env_Type" "Env_Datacenter"
-    "Scope" "Role" "Username" "Email" "Batch_Id"
+    "Scope" "Role"
+    "Username" "Email" "First_Name" "Last_Name"
+    "Batch_Id"
   )
 
   # Total binding columns in the CSV (including Foundation_Slug + Batch_Id).
