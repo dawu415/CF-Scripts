@@ -1,5 +1,15 @@
 #!/bin/bash
 
+if ! cf oauth-token >/dev/null 2>&1; then
+  cat >&2 <<'EOF'
+No active Cloud Foundry login session found.
+Log in before running this script, for example:
+  export CF_API=https://api.sys.example.com
+  cf login -a "$CF_API" -u "$CF_USERNAME" -p "$CF_PASSWORD"
+EOF
+  exit 7
+fi
+
 # Output CSV header
 echo "Org,Space,App Name"
 
