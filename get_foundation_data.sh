@@ -48,6 +48,26 @@ command -v jq    >/dev/null 2>&1 || { echo "jq not found in PATH" >&2; exit 6; }
 command -v xargs >/dev/null 2>&1 || { echo "xargs not found in PATH" >&2; exit 6; }
 command -v flock >/dev/null 2>&1 || { echo "flock not found in PATH" >&2; exit 6; }
 
+if [[ -z "${CF_API:-}" ]]; then
+  cat >&2 <<'EOF'
+CF_API is required but not set.
+Set it before running this script, for example:
+  export CF_API=https://api.sys.example.com
+  cf login -a "$CF_API" -u "$CF_USERNAME" -p "$CF_PASSWORD"
+EOF
+  exit 7
+fi
+
+if ! cf oauth-token >/dev/null 2>&1; then
+  cat >&2 <<'EOF'
+No active Cloud Foundry login session found.
+Log in before running this script, for example:
+  export CF_API=https://api.sys.example.com
+  cf login -a "$CF_API" -u "$CF_USERNAME" -p "$CF_PASSWORD"
+EOF
+  exit 7
+fi
+
 # Derive a reasonable foundation slug from CF_API when the orchestrator
 # does not provide CF_FOUNDATION or CF_ORCH_PLATFORM.
 # Examples:
