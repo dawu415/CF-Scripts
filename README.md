@@ -98,9 +98,9 @@ cf login -a "$CF_API" -u "$CF_USERNAME" -p "$CF_PASSWORD"
 Required in practice:
 
 - `CF_API`
-  Not strictly required by every script, but it should be set. `get_foundation_data.sh` uses it to derive a foundation slug when `CF_FOUNDATION` or `CF_ORCH_PLATFORM` is not provided.
+  Required for `get_foundation_data.sh`. Set it before running the script.
 - Active `cf login` session
-  Required for all CF API calls made by the scripts above.
+  Required for all CF API calls made by the scripts above. `get_foundation_data.sh` now checks for an active session at startup and exits if none exists.
 
 Optional but commonly useful:
 
@@ -152,7 +152,7 @@ Optional but recommended:
 
 ### 1. Collect CF foundation data locally
 
-Log in with the CF CLI first, then run:
+Set `CF_API`, log in with the CF CLI, then run:
 
 ```bash
 export CF_API=https://api.sys.example.com
@@ -163,7 +163,9 @@ cf login -a "$CF_API" -u "$CF_USERNAME" -p "$CF_PASSWORD"
 Useful environment variables:
 
 - `CF_API`
-  Strongly recommended. Used to derive the foundation name when explicit foundation variables are not set.
+  Required. The script exits immediately if it is not set.
+- Active `cf login` session
+  Required. The script checks for an active session before doing any collection.
 - `CF_ORCH_DATA_MODE`
   `multi` by default. In `multi` mode, `CF_ORCH_DATA_OUT` is treated as a directory. In `single` mode, it is treated as a CSV file path.
 - `CF_ORCH_DATA_OUT`
@@ -180,12 +182,13 @@ Useful environment variables:
 Example:
 
 ```bash
-export CF_API=https://api.system.fd-prod-chd.example.com
+export CF_API=https://api.sys.example.com
 export CF_ORCH_DATA_MODE=multi
 export CF_ORCH_DATA_OUT=./out/fd-prod-chd
 export CF_ORCH_PLATFORM=fd-prod-chd
 export ENV_LOCATION=chicago
 export ENV_TYPE=prod
+cf login -a "$CF_API" -u "$CF_USERNAME" -p "$CF_PASSWORD"
 ./get_foundation_data.sh
 ```
 
