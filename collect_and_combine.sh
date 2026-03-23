@@ -71,10 +71,12 @@ echo "Collected ${csv_count} CSVs into ${DATA_DIR}/"
 echo ""
 echo "Combining CSVs into combined report..."
 
-COMBINED="${DATA_DIR}/combined.csv"
+# Extract date (YYYYMMDD) from RunTag (YYYYMMDD-HHMMSS)
+RUN_DATE="${RUNTAG%%-*}"
+COMBINED="${DATA_DIR}/cf_fs4migration_${RUN_DATE}.csv"
 first=true
 
-for f in $(find "$DATA_DIR" -name "*.csv" ! -name "combined.csv" | sort); do
+for f in $(find "$DATA_DIR" -name "*.csv" ! -name "cf_fs4migration_*.csv" | sort); do
   if [ "$first" = true ]; then
     head -1 "$f" > "$COMBINED"
     first=false
