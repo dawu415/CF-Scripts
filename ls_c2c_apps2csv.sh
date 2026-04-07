@@ -1,5 +1,15 @@
 #!/bin/bash
 
+if ! cf oauth-token >/dev/null 2>&1; then
+  cat >&2 <<'EOF'
+No active Cloud Foundry login session found.
+Log in before running this script, for example:
+  export CF_API=https://api.sys.example.com
+  cf login -a "$CF_API" -u "$CF_USERNAME" -p "$CF_PASSWORD"
+EOF
+  exit 7
+fi
+
 # Output CSV header
 echo "Source Org,Source Space,Source App,Destination Org,Destination Space,Destination App,Port,Protocol"
 
@@ -37,4 +47,3 @@ echo "$policies" | jq -c '.policies[]' | while read -r policy; do
   # Output policy details in CSV format
   echo "$source_org_name,$source_space_name,$source_app_name,$dest_org_name,$dest_space_name,$dest_app_name,$port,$protocol"
 done
-

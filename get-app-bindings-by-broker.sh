@@ -36,9 +36,15 @@ OFFERING_NAME_FILTER="${2:-}"
   echo "Usage: $0 <broker_name> [offering_name_exact]" >&2; exit 1;
 }
 
-cf api >/dev/null 2>&1 || {
-  echo "cf CLI not logged in" >&2; exit 1;
-}
+if ! cf oauth-token >/dev/null 2>&1; then
+  cat >&2 <<'EOF'
+No active Cloud Foundry login session found.
+Log in before running this script, for example:
+  export CF_API=https://api.sys.example.com
+  cf login -a "$CF_API" -u "$CF_USERNAME" -p "$CF_PASSWORD"
+EOF
+  exit 7
+fi
 
 enc() {
   jq -rn --arg s "$1" '$s|@uri'
