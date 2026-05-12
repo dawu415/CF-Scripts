@@ -517,7 +517,7 @@ extract_full_version() {
   [[ -z "$filename" || "$filename" == "null" ]] && { echo ""; return; }
   # Extract the semantic version portion of a buildpack filename. Mirrors
   # the Apps Script helper (see Utilities.js) where we look for "-vX.Y[.Z...]".
-  if [[ "$filename" =~ -v([0-9]+\.[0-9]+(?:\.[0-9]+)?(?:-[[:alnum:]._-]+)?(?:\+[[:alnum:]._-]+)?) ]]; then
+  if [[ "$filename" =~ -v([0-9]+\.[0-9]+(\.[0-9]+)?(-[[:alnum:]._-]+)?(\+[[:alnum:]._-]+)?) ]]; then
     echo "${BASH_REMATCH[1]}"
   else
     local fallback
