@@ -513,17 +513,29 @@ simplify_buildpack_name() {
 }
 
 extract_full_version() {
-  local filename="$1"
+  local filename="$1" stripped fallback
   [[ -z "$filename" || "$filename" == "null" ]] && { echo ""; return; }
+
   # Extract the semantic version portion of a buildpack filename. Mirrors
   # the Apps Script helper (see Utilities.js) where we look for "-vX.Y[.Z...]".
-  if [[ "$filename" =~ -v([0-9]+\.[0-9]+(\.[0-9]+)?(-[[:alnum:]._-]+)?(\+[[:alnum:]._-]+)?) ]]; then
+  #
+  # Strip known buildpack archive extensions first so the character class
+  # below doesn't swallow ".zip" / ".tgz" / ".tar.gz" as part of a
+  # pre-release identifier (e.g. "v1.2.3-rc1.zip" -> "1.2.3-rc1").
+  stripped="$filename"
+  stripped="${stripped%.zip}"
+  stripped="${stripped%.tgz}"
+  stripped="${stripped%.tar.gz}"
+
+  # Match "-vMAJOR.MINOR[.PATCH][-prerelease][+build]" anchored to end.
+  # POSIX ERE only: no (?:...) non-capturing groups (bash 5.3 rejects them).
+  if [[ "$stripped" =~ -v([0-9]+\.[0-9]+(\.[0-9]+)?(-[0-9A-Za-z-][0-9A-Za-z.-]*)?(\+[0-9A-Za-z-][0-9A-Za-z.-]*)?)$ ]]; then
     echo "${BASH_REMATCH[1]}"
-  else
-    local fallback
-    fallback=$(echo "$filename" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1 || true)
-    echo "$fallback"
+    return
   fi
+
+  fallback=$(printf '%s' "$filename" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1 || true)
+  echo "$fallback"
 }
 
 ###############################################################################
